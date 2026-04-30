@@ -1,0 +1,804 @@
+#!/usr/bin/env python3
+"""
+copy-fail-check - Detection and remediation toolkit for CVE-2026-31431.
+Maintained by BleedWatch SASU. https://github.com/bleedwatch/copy-fail-check
+"""
+
+import argparse
+import atexit
+import errno
+import glob
+import hashlib
+import json
+import os
+import platform
+import secrets
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+
+VERSION = "1.0.0"
+TOOL_NAME = "copy-fail-check"
+REPOSITORY_URL = "https://github.com/bleedwatch/copy-fail-check"
+INFO_URI = REPOSITORY_URL
+CVE_ID = "CVE-2026-31431"
+RULE_ID = "BLEEDWATCH-CVE-2026-31431"
+AUDIT_LOG = "/var/log/bleedwatch-copy-fail-mitigation.log"
+MITIGATION_FILE = "/etc/modprobe.d/disable-af-alg.conf"
+MODULES = ("af_alg", "algif_aead", "algif_skcipher", "algif_hash", "algif_rng")
+ALGIF_MODULES = ("algif_aead", "algif_skcipher", "algif_hash", "algif_rng")
+LAST_UNFIXED_MAINLINE = (6, 14, 99)
+PATCH_COMMIT = "a664bf3d603d"
+
+EXIT_SAFE = 0
+EXIT_VULNERABLE = 2
+EXIT_MITIGATED = 3
+EXIT_DETECTION_ERROR = 10
+EXIT_RUNTIME_ERROR = 11
+EXIT_REMEDIATED = 20
+EXIT_REMEDIATION_CANCELLED = 21
+EXIT_REMEDIATION_FAILED = 22
+
+
+def utc_now_z():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def read_text(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return default
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def parse_os_release_content(content):
+    result = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1]
+        result[key] = value
+    return result
+
+
+def kernel_tuple(release):
+    parts = []
+    current = ""
+    for char in release:
+        if char.isdigit():
+            current += char
+        elif current:
+            parts.append(int(current))
+            current = ""
+            if len(parts) == 3:
+                break
+        elif parts:
+            break
+    if current and len(parts) < 3:
+        parts.append(int(current))
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def module_name_from_proc(name):
+    return name.replace("-", "_")
+
+
+def distro_family(os_info):
+    distro_id = os_info.get("ID", "").lower()
+    like = os_info.get("ID_LIKE", "").lower().split()
+    names = [distro_id] + like
+    if any(name in names for name in ("debian", "ubuntu")):
+        return "debian"
+    if any(name in names for name in ("rhel", "fedora", "centos", "amzn", "amazon")):
+        return "rhel"
+    if any(name in names for name in ("suse", "opensuse", "sles")):
+        return "suse"
+    return "unsupported"
+
+
+def colorize(text, color, enabled):
+    if not enabled:
+        return text
+    colors = {"red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m", "bold": "\033[1m"}
+    return colors.get(color, "") + text + "\033[0m"
+
+
+class CopyFailDetector:
+    def __init__(self, root="/", tmp_dir="/tmp", functional_test=True, deep_patch_check=False):
+        self.root = root
+        self.tmp_dir = tmp_dir
+        self.functional_test = functional_test
+        self.deep_patch_check = deep_patch_check
+        self.warnings = []
+
+    def root_path(self, absolute_path):
+        if self.root == "/":
+            return absolute_path
+        return os.path.join(self.root, absolute_path.lstrip("/"))
+
+    def detect(self):
+        timestamp = utc_now_z()
+        host = {
+            "hostname": platform.node(),
+            "os": {"distro": None, "version": None, "codename": None, "family": None},
+            "kernel": {"version": platform.release(), "patch_status": "unverified"},
+        }
+        checks = {
+            "environment": {"status": "unknown", "errors": []},
+            "af_alg_syscall": {"status": "unknown", "errno": None, "detail": None},
+            "functional_test": {"status": "not_run", "detail": None},
+            "modules_loaded": [],
+            "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
+            "kernel_patch": {"detected": False, "evidence": None},
+        }
+
+        env_status, env_errors, os_info = self.detect_environment()
+        checks["environment"] = {"status": env_status, "errors": env_errors}
+        host["os"] = {
+            "distro": os_info.get("ID"),
+            "version": os_info.get("VERSION_ID"),
+            "codename": os_info.get("VERSION_CODENAME") or os_info.get("UBUNTU_CODENAME"),
+            "family": distro_family(os_info),
+        }
+
+        release = platform.release()
+        proc_version = read_text(self.root_path("/proc/version"), default="")
+        host["kernel"]["version"] = release
+
+        modules_loaded = self.list_loaded_modules()
+        checks["modules_loaded"] = modules_loaded
+        checks["modprobe_mitigation"] = self.analyze_modprobe()
+        checks["kernel_patch"] = self.analyze_kernel_patch(os_info, release, proc_version)
+        host["kernel"]["patch_status"] = "patched" if checks["kernel_patch"]["detected"] else "unverified"
+
+        if env_status != "ok":
+            return self.build_result(timestamp, host, checks, "detection_error", True, EXIT_RUNTIME_ERROR,
+                                     "Unsupported or unexpected runtime environment", env_errors)
+
+        checks["af_alg_syscall"] = self.check_af_alg_syscall()
+        af_status = checks["af_alg_syscall"]["status"]
+        if af_status == "accessible" and self.functional_test:
+            checks["functional_test"] = self.run_functional_test()
+        elif af_status == "blocked":
+            checks["functional_test"] = {"status": "not_run", "detail": "AF_ALG unavailable"}
+        else:
+            checks["functional_test"] = {"status": "not_run", "detail": "AF_ALG status did not permit safe test"}
+
+        verdict_status, vulnerable, exit_code, summary, recommendations = self.verdict(host, checks)
+        return self.build_result(timestamp, host, checks, verdict_status, vulnerable, exit_code, summary,
+                                 recommendations)
+
+    def build_result(self, timestamp, host, checks, verdict_status, vulnerable, exit_code, summary, recommendations):
+        return {
+            "tool": TOOL_NAME,
+            "version": VERSION,
+            "timestamp": timestamp,
+            "host": host,
+            "checks": checks,
+            "verdict": {
+                "status": verdict_status,
+                "vulnerable": vulnerable,
+                "exit_code": exit_code,
+                "summary": summary,
+                "recommendations": recommendations,
+            },
+        }
+
+    def detect_environment(self):
+        errors = []
+        if sys.platform != "linux":
+            errors.append("copy-fail-check supports Linux only")
+        if "microsoft" in platform.release().lower() and not os.path.exists("/proc/sys/kernel/osrelease"):
+            errors.append("WSL1 is not supported")
+        proc_path = self.root_path("/proc/version")
+        if not os.path.exists(proc_path):
+            errors.append("/proc is not accessible")
+        os_release = self.root_path("/etc/os-release")
+        os_info = parse_os_release_content(read_text(os_release, default=""))
+        if not os_info:
+            errors.append("/etc/os-release is missing or unreadable")
+        elif distro_family(os_info) == "unsupported":
+            errors.append("unsupported Linux distribution: {}".format(os_info.get("ID", "unknown")))
+        return ("error" if errors else "ok", errors, os_info)
+
+    def check_af_alg_syscall(self):
+        if not hasattr(socket, "AF_ALG"):
+            return {"status": "blocked", "errno": errno.EAFNOSUPPORT, "detail": "Python socket has no AF_ALG support"}
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
+            return {"status": "accessible", "errno": None, "detail": "AF_ALG socket creation succeeded"}
+        except OSError as exc:
+            if exc.errno in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT):
+                return {"status": "blocked", "errno": exc.errno, "detail": os.strerror(exc.errno)}
+            return {"status": "error", "errno": exc.errno, "detail": str(exc)}
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def list_loaded_modules(self):
+        content = read_text(self.root_path("/proc/modules"), default="")
+        loaded = []
+        wanted = set(MODULES)
+        for line in content.splitlines():
+            fields = line.split()
+            if fields:
+                module = module_name_from_proc(fields[0])
+                if module in wanted:
+                    loaded.append(module)
+        return loaded
+
+    def analyze_modprobe(self):
+        files = []
+        blocked = {}
+        warnings = []
+        pattern = self.root_path("/etc/modprobe.d/*.conf")
+        for path in sorted(glob.glob(pattern)):
+            content = read_text(path, default="")
+            seen = []
+            for line in content.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                tokens = stripped.split()
+                if len(tokens) >= 2 and tokens[0] == "blacklist":
+                    module = module_name_from_proc(tokens[1])
+                    if module in MODULES:
+                        blocked[module] = "blacklist"
+                        seen.append(module)
+                if len(tokens) >= 3 and tokens[0] == "install":
+                    module = module_name_from_proc(tokens[1])
+                    command = " ".join(tokens[2:])
+                    if module in MODULES and command in ("/bin/false", "/usr/bin/false", "false", "/bin/true"):
+                        blocked[module] = "install"
+                        seen.append(module)
+            if seen:
+                files.append(path if self.root == "/" else "/" + os.path.relpath(path, self.root))
+        if "af_alg" in blocked and "algif_aead" not in blocked:
+            warnings.append("af_alg is blocked but algif_aead is not explicitly blocked")
+        missing = [module for module in MODULES if module not in blocked]
+        if not blocked:
+            completeness = "none"
+        elif missing:
+            completeness = "partial"
+        else:
+            completeness = "full"
+        return {"present": bool(blocked), "files": files, "completeness": completeness, "warnings": warnings}
+
+    def analyze_kernel_patch(self, os_info, release, proc_version):
+        evidence_tokens = (CVE_ID, PATCH_COMMIT, "authencesn", "copy fail")
+        haystack = "\n".join([proc_version, release]).lower()
+        for token in evidence_tokens:
+            if token.lower() in haystack:
+                return {"detected": True, "evidence": "kernel metadata references {}".format(token)}
+        if kernel_tuple(release) > LAST_UNFIXED_MAINLINE:
+            return {"detected": True, "evidence": "mainline kernel version is newer than last known unfixed range"}
+        if self.deep_patch_check:
+            evidence = self.query_package_changelog(os_info, release)
+            if evidence:
+                return {"detected": True, "evidence": evidence}
+        return {"detected": False, "evidence": None}
+
+    def query_package_changelog(self, os_info, release):
+        family = distro_family(os_info)
+        commands = []
+        if family == "debian" and shutil.which("apt"):
+            commands.append(["apt", "changelog", "linux-image-{}".format(release)])
+        elif family == "rhel" and shutil.which("rpm"):
+            commands.append(["rpm", "-q", "--changelog", "kernel"])
+        elif family == "suse" and shutil.which("rpm"):
+            commands.append(["rpm", "-q", "--changelog", "kernel-default"])
+        for command in commands:
+            try:
+                completed = subprocess.run(command, check=False, timeout=60, capture_output=True, text=True)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            haystack = (completed.stdout + "\n" + completed.stderr).lower()
+            for token in (CVE_ID.lower(), PATCH_COMMIT.lower(), "authencesn", "copy fail"):
+                if token in haystack:
+                    return "package changelog references {}".format(token)
+        return None
+
+    def make_sentinel_path(self):
+        token = secrets.token_hex(8)
+        return os.path.join(self.tmp_dir, "copy-fail-sentinel-{}-{}-{}".format(os.getpid(), time.time_ns(), token))
+
+    def run_functional_test(self):
+        path = self.make_sentinel_path()
+        assert path.startswith("/tmp/")
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        state = {"fd": None}
+        cleanup_done = {"ok": False}
+        previous_handlers = {}
+
+        def cleanup():
+            if state["fd"] is not None:
+                try:
+                    os.close(state["fd"])
+                except OSError:
+                    pass
+                state["fd"] = None
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            cleanup_done["ok"] = not os.path.exists(path)
+
+        def signal_handler(signum, frame):
+            cleanup()
+            if not cleanup_done["ok"]:
+                raise RuntimeError("sentinel cleanup failed after signal {}".format(signum))
+            previous = previous_handlers.get(signum)
+            if callable(previous):
+                signal.signal(signum, previous)
+                previous(signum, frame)
+            if signum == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise SystemExit(128 + signum)
+
+        try:
+            if os.path.exists(path):
+                return {"status": "setup_failed", "detail": "sentinel path collision refused"}
+            state["fd"] = os.open(path, flags, 0o600)
+            mode = stat.S_IMODE(os.fstat(state["fd"]).st_mode)
+            if mode != 0o600:
+                return {"status": "setup_failed", "detail": "sentinel permissions were not 0600"}
+            atexit.register(cleanup)
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                previous_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, signal_handler)
+
+            pattern = (b"CFCHECK:" * 512)[:4096]
+            write_all(state["fd"], pattern)
+            os.fsync(state["fd"])
+            os.lseek(state["fd"], 0, os.SEEK_SET)
+            os.read(state["fd"], len(pattern))
+            primitive_status = self.attempt_copy_fail_primitive(path)
+            os.lseek(state["fd"], 0, os.SEEK_SET)
+            after = os.read(state["fd"], len(pattern))
+            if after != pattern:
+                return {"status": "modification_detected", "detail": "sentinel page cache changed at offset 0"}
+            if primitive_status != "attempted":
+                return {"status": "setup_failed", "detail": primitive_status}
+            return {"status": "no_modification", "detail": "sentinel remained unchanged"}
+        except OSError as exc:
+            detail = "{}: {}".format(exc.errno, exc.strerror)
+            if exc.errno in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EPERM, errno.EACCES):
+                return {"status": "setup_failed", "detail": detail}
+            return {"status": "error", "detail": detail}
+        finally:
+            cleanup()
+            try:
+                atexit.unregister(cleanup)
+            except (AttributeError, ValueError):
+                pass
+            for signum, previous in previous_handlers.items():
+                try:
+                    signal.signal(signum, previous)
+                except (OSError, RuntimeError, ValueError):
+                    pass
+
+    def attempt_copy_fail_primitive(self, sentinel_path):
+        assert sentinel_path.startswith("/tmp/")
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
+            try:
+                sock.bind(("aead", "authencesn(hmac(sha1),cbc(aes))"))
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ENODEV, errno.EINVAL, errno.EOPNOTSUPP):
+                    return "AF_ALG authencesn primitive unavailable: {}".format(exc)
+                raise
+            return "attempted"
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def verdict(self, host, checks):
+        mitigation = checks["modprobe_mitigation"]
+        patch = checks["kernel_patch"]
+        af_alg = checks["af_alg_syscall"]
+        functional = checks["functional_test"]
+        loaded = set(checks["modules_loaded"])
+        recommendations = []
+
+        if loaded and mitigation["present"]:
+            recommendations.append("Reboot to unload AF_ALG modules that were already resident before mitigation")
+        if mitigation["completeness"] == "partial":
+            recommendations.append("Complete modprobe mitigation for af_alg and algif_* modules")
+
+        if functional["status"] == "modification_detected":
+            recommendations.append("Apply the vendor kernel update or run --remediate for immediate AF_ALG mitigation")
+            return ("vulnerable_confirmed_functional", True, EXIT_VULNERABLE,
+                    "Vulnerable - functional sentinel test detected page cache modification", recommendations)
+
+        if patch["detected"]:
+            if mitigation["present"] and loaded:
+                recommendations.append("Reboot when practical so loaded AF_ALG modules match boot-time policy")
+            return ("patched", False, EXIT_SAFE, "Non vulnerable - kernel patch evidence detected", recommendations)
+
+        if af_alg["status"] == "blocked" or mitigation["completeness"] == "full":
+            recommendations.append("Install the vendor kernel update when available; keep mitigation until reboot validation")
+            return ("mitigated_modprobe", False, EXIT_MITIGATED,
+                    "Vulnerable kernel exposure mitigated - AF_ALG blocked or fully disabled", recommendations)
+
+        if af_alg["status"] == "accessible":
+            recommendations.append("Patch the kernel or run sudo python3 copy-fail-check.py --remediate")
+            recommendations.append("Avoid relying on containers as a boundary for shared-kernel workloads")
+            return ("vulnerable_inferred_kernel", True, EXIT_VULNERABLE,
+                    "Vulnerable inferred - AF_ALG accessible and patch evidence not found", recommendations)
+
+        recommendations.append("Re-run with --audit on the host, not inside a restricted container")
+        return ("detection_error", True, EXIT_DETECTION_ERROR,
+                "Detection inconclusive - AF_ALG syscall check failed unexpectedly", recommendations)
+
+
+class CopyFailRemediator:
+    def __init__(self, root="/", input_func=input, subprocess_run=subprocess.run, euid_func=None):
+        self.root = root
+        self.input_func = input_func
+        self.subprocess_run = subprocess_run
+        self.euid_func = euid_func or (os.geteuid if hasattr(os, "geteuid") else lambda: 1)
+        self.actions = []
+        self.warnings = []
+
+    def root_path(self, absolute_path):
+        if self.root == "/":
+            return absolute_path
+        return os.path.join(self.root, absolute_path.lstrip("/"))
+
+    def desired_content(self):
+        return "\n".join([
+            "# CVE-2026-31431 (Copy Fail) mitigation",
+            "# Generated by copy-fail-check v{} on {}".format(VERSION, utc_now_z().split("T")[0]),
+            "# {}".format(REPOSITORY_URL),
+            "# Audit log: {}".format(AUDIT_LOG),
+            "install af_alg          /bin/false",
+            "install algif_aead      /bin/false",
+            "install algif_skcipher  /bin/false",
+            "install algif_hash      /bin/false",
+            "install algif_rng       /bin/false",
+            "",
+        ])
+
+    def confirm(self):
+        if os.environ.get("BLEEDWATCH_AUTO_CONFIRM") == "1":
+            return True
+        print("copy-fail-check remediation will:")
+        print("  - create or update {}".format(MITIGATION_FILE))
+        print("  - unload AF_ALG modules when possible")
+        print("  - rebuild initramfs using the detected distribution tool")
+        print("  - append audit details to {}".format(AUDIT_LOG))
+        answer = self.input_func("Type 'CONFIRM' to proceed: ")
+        return answer == "CONFIRM"
+
+    def remediate(self):
+        if self.euid_func() != 0:
+            return EXIT_REMEDIATION_FAILED, "Root privileges are required for remediation"
+        modprobe_dir = self.root_path("/etc/modprobe.d")
+        if not os.path.isdir(modprobe_dir) or not os.access(modprobe_dir, os.W_OK):
+            return EXIT_REMEDIATION_FAILED, "{} is not writable".format(modprobe_dir)
+        if not self.confirm():
+            return EXIT_REMEDIATION_CANCELLED, "Remediation cancelled by user"
+
+        try:
+            self.ensure_audit_log()
+            self.backup_blacklist_conf()
+            self.write_mitigation_file()
+            self.unload_modules()
+            self.rebuild_initramfs()
+            detector = CopyFailDetector(root=self.root, functional_test=False)
+            result = detector.detect()
+            self.audit("post_check", json.dumps(result["verdict"], sort_keys=True))
+            if result["verdict"]["exit_code"] in (EXIT_SAFE, EXIT_MITIGATED):
+                return EXIT_REMEDIATED, "Remediation applied; reboot recommended"
+            return EXIT_REMEDIATION_FAILED, "Post-check still reports exposure: {}".format(result["verdict"]["summary"])
+        except OSError as exc:
+            self.audit("error", str(exc))
+            return EXIT_REMEDIATION_FAILED, str(exc)
+
+    def ensure_audit_log(self):
+        log_path = self.root_path(AUDIT_LOG)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            if self.euid_func() == 0:
+                try:
+                    os.fchown(fd, 0, 0)
+                except OSError:
+                    pass
+        finally:
+            os.close(fd)
+
+    def audit(self, event, message):
+        log_path = self.root_path(AUDIT_LOG)
+        line = "{} {} {}\n".format(utc_now_z(), event, message.replace("\n", "\\n"))
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+
+    def backup_blacklist_conf(self):
+        path = self.root_path("/etc/modprobe.d/blacklist.conf")
+        if os.path.exists(path):
+            backup = "{}.bak.{}".format(path, int(time.time()))
+            shutil.copy2(path, backup)
+            self.actions.append("backed up {}".format(backup))
+            self.audit("backup", backup)
+
+    def write_mitigation_file(self):
+        path = self.root_path(MITIGATION_FILE)
+        desired = self.desired_content()
+        if os.path.exists(path):
+            current = read_text(path, default="")
+            if current == desired:
+                self.actions.append("mitigation file already current")
+                self.audit("skip", "{} already current".format(MITIGATION_FILE))
+                return
+            current_hash = hashlib.sha256(current.encode("utf-8", errors="replace")).hexdigest()
+            backup = "{}.bak.{}".format(path, int(time.time()))
+            shutil.copy2(path, backup)
+            warning = "{} differed from desired content; backed up to {} sha256={}".format(
+                MITIGATION_FILE, backup, current_hash
+            )
+            self.warnings.append(warning)
+            self.audit("warning", warning)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(desired)
+        os.chmod(path, 0o644)
+        self.actions.append("wrote {}".format(MITIGATION_FILE))
+        self.audit("write", MITIGATION_FILE)
+
+    def unload_modules(self):
+        for module in list(ALGIF_MODULES) + ["af_alg"]:
+            command = ["rmmod", module]
+            self.run_command(command, "rmmod {}".format(module))
+
+    def rebuild_initramfs(self):
+        os_info = parse_os_release_content(read_text(self.root_path("/etc/os-release"), default=""))
+        family = distro_family(os_info)
+        command = None
+        if family == "debian":
+            command = ["update-initramfs", "-u"]
+        elif family == "rhel":
+            command = ["dracut", "-f"]
+        elif family == "suse":
+            command = ["dracut", "-f"] if shutil.which("dracut") else ["mkinitrd"]
+        if command is None:
+            self.audit("skip", "unsupported initramfs family {}".format(family))
+            return
+        self.run_command(command, "initramfs rebuild")
+
+    def run_command(self, command, label):
+        try:
+            completed = self.subprocess_run(
+                command, check=False, timeout=60, capture_output=True, text=True, shell=False
+            )
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+            self.audit("command", "{} rc={} stdout={} stderr={}".format(label, completed.returncode, stdout, stderr))
+            self.actions.append("{} rc={}".format(label, completed.returncode))
+            return completed.returncode
+        except FileNotFoundError as exc:
+            self.audit("command_missing", "{} {}".format(label, exc))
+            self.actions.append("{} skipped: command missing".format(label))
+            return 127
+        except subprocess.SubprocessError as exc:
+            self.audit("command_error", "{} {}".format(label, exc))
+            return 124
+
+
+def make_json(result):
+    return json.dumps(result, indent=2, sort_keys=False) + "\n"
+
+
+def make_sarif(result):
+    verdict = result["verdict"]
+    level = "error" if verdict["vulnerable"] else "warning" if verdict["exit_code"] == EXIT_MITIGATED else "note"
+    results = []
+    if verdict["status"] in ("vulnerable_confirmed_functional", "vulnerable_inferred_kernel", "mitigated_modprobe"):
+        results.append({
+            "ruleId": RULE_ID,
+            "level": level,
+            "message": {"text": verdict["summary"]},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": "file:///proc/version"}
+                }
+            }],
+        })
+    for warning in result["checks"]["modprobe_mitigation"].get("warnings", []):
+        results.append({
+            "ruleId": RULE_ID,
+            "level": "warning",
+            "message": {"text": warning},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": "file:///etc/modprobe.d/"}
+                }
+            }],
+        })
+    return json.dumps({
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": TOOL_NAME,
+                    "version": VERSION,
+                    "informationUri": INFO_URI,
+                    "rules": [{
+                        "id": RULE_ID,
+                        "name": "Copy Fail Linux AF_ALG exposure",
+                        "shortDescription": {"text": "Detects CVE-2026-31431 Copy Fail exposure"},
+                        "fullDescription": {
+                            "text": "Detects AF_ALG and algif_aead exposure to CVE-2026-31431 and reports patch or mitigation status."
+                        },
+                        "helpUri": REPOSITORY_URL,
+                        "defaultConfiguration": {"level": "error"},
+                    }],
+                }
+            },
+            "results": results,
+        }],
+    }, indent=2, sort_keys=False) + "\n"
+
+
+def make_human(result, use_color=True):
+    verdict = result["verdict"]
+    checks = result["checks"]
+    host = result["host"]
+    if verdict["vulnerable"]:
+        verdict_color = "red"
+    elif verdict["exit_code"] == EXIT_MITIGATED:
+        verdict_color = "yellow"
+    else:
+        verdict_color = "green"
+    lines = [
+        colorize("BleedWatch copy-fail-check v{}".format(VERSION), "bold", use_color),
+        "Detection and remediation toolkit for {}".format(CVE_ID),
+        "",
+        "Environment",
+        "  Host: {}".format(host["hostname"]),
+        "  OS: {} {} ({})".format(host["os"]["distro"], host["os"]["version"], host["os"]["family"]),
+        "  Kernel: {}".format(host["kernel"]["version"]),
+        "",
+        "Kernel",
+        "  Patch status: {}".format(host["kernel"]["patch_status"]),
+        "  Patch evidence: {}".format(checks["kernel_patch"]["evidence"] or "none"),
+        "",
+        "AF_ALG Status",
+        "  Syscall: {}".format(checks["af_alg_syscall"]["status"]),
+        "  Functional test: {}".format(checks["functional_test"]["status"]),
+        "  Loaded modules: {}".format(", ".join(checks["modules_loaded"]) or "none detected"),
+        "",
+        "Modprobe Mitigation",
+        "  Present: {}".format(str(checks["modprobe_mitigation"]["present"]).lower()),
+        "  Completeness: {}".format(checks["modprobe_mitigation"]["completeness"]),
+        "  Files: {}".format(", ".join(checks["modprobe_mitigation"]["files"]) or "none"),
+        "",
+        "Verdict",
+        "  {}".format(colorize(verdict["summary"], verdict_color, use_color)),
+        "  Exit code: {}".format(verdict["exit_code"]),
+    ]
+    if verdict["recommendations"]:
+        lines.append("  Recommendations:")
+        for recommendation in verdict["recommendations"]:
+            lines.append("    - {}".format(recommendation))
+    lines.extend([
+        "",
+        "GitHub: {}".format(REPOSITORY_URL),
+        "Star the repository to follow Copy Fail mitigation updates.",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def emit_output(text, output_file):
+    if output_file:
+        with open(output_file, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    else:
+        sys.stdout.write(text)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Detect and remediate CVE-2026-31431 Copy Fail exposure")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="run read-only detection (default)")
+    mode.add_argument("--audit", action="store_true", help="run detection plus deeper diagnostic checks")
+    mode.add_argument("--remediate", action="store_true", help="apply AF_ALG modprobe mitigation after confirmation")
+    mode.add_argument("--verify", action="store_true", help="verify an earlier remediation")
+    parser.add_argument("--json", action="store_true", help="emit structured JSON")
+    parser.add_argument("--sarif", action="store_true", help="emit SARIF 2.1.0 JSON")
+    parser.add_argument("--quiet", action="store_true", help="suppress human-readable output")
+    parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    parser.add_argument("--output-file", help="write output to a file")
+    parser.add_argument("--version", action="store_true", help="print version and exit")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.version:
+        print("{} {}".format(TOOL_NAME, VERSION))
+        return EXIT_SAFE
+    if sys.version_info < (3, 8):
+        sys.stderr.write("Python 3.8 or newer is required\n")
+        return EXIT_RUNTIME_ERROR
+
+    if args.remediate:
+        remediator = CopyFailRemediator()
+        code, message = remediator.remediate()
+        if not args.quiet:
+            result = {
+                "tool": TOOL_NAME,
+                "version": VERSION,
+                "timestamp": utc_now_z(),
+                "remediation": {
+                    "exit_code": code,
+                    "summary": message,
+                    "actions": remediator.actions,
+                    "warnings": remediator.warnings,
+                },
+            }
+            if args.json:
+                emit_output(make_json(result), args.output_file)
+            elif args.sarif:
+                detector_result = CopyFailDetector(functional_test=False).detect()
+                emit_output(make_sarif(detector_result), args.output_file)
+            else:
+                lines = [message]
+                lines.extend(remediator.actions)
+                lines.extend("warning: {}".format(warning) for warning in remediator.warnings)
+                emit_output("\n".join(lines) + "\n", args.output_file)
+        return code
+
+    detector = CopyFailDetector(functional_test=not args.verify, deep_patch_check=args.audit)
+    result = detector.detect()
+    if not args.quiet:
+        if args.json:
+            output = make_json(result)
+        elif args.sarif:
+            output = make_sarif(result)
+        else:
+            use_color = not args.no_color and "NO_COLOR" not in os.environ
+            output = make_human(result, use_color)
+        emit_output(output, args.output_file)
+    return result["verdict"]["exit_code"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
