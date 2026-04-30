@@ -1,0 +1,73 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ubuntu:
+    name: Ubuntu ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: "3.8"
+          - os: ubuntu-22.04
+            python: "3.10"
+          - os: ubuntu-24.04
+            python: "3.12"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Version smoke test
+        run: python3 copy-fail-check.py --version
+
+      - name: JSON smoke test
+        run: python3 copy-fail-check.py --check --json | python3 -m json.tool >/dev/null
+
+      - name: SARIF smoke test
+        run: python3 copy-fail-check.py --check --sarif | python3 -m json.tool >/dev/null
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+  debian:
+    name: Debian ${{ matrix.version }} / system Python
+    runs-on: ubuntu-24.04
+    container: debian:${{ matrix.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["11", "12"]
+    steps:
+      - name: Prepare container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git python3 ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Version smoke test
+        run: python3 copy-fail-check.py --version
+
+      - name: JSON smoke test
+        run: python3 copy-fail-check.py --check --json | python3 -m json.tool >/dev/null
+
+      - name: SARIF smoke test
+        run: python3 copy-fail-check.py --check --sarif | python3 -m json.tool >/dev/null
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
