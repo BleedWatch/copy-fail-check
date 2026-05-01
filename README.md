@@ -1,5 +1,18 @@
 # copy-fail-check: CVE-2026-31431 Copy Fail Detection and Remediation
 
+> **⚠️ ADVISORY — v1.0.0 yanked**
+>
+> Version 1.0.0 produces false negatives on systems where the kernel
+> backport status cannot be inferred from the mainline version number
+> (notably Fedora, and any distro running stable branches below 7.0-rc7
+> with potential backports). The functional test in v1.0.0 is also
+> incomplete and does not exercise the full Copy Fail primitive.
+>
+> If you ran v1.0.0 and got a "Non vulnerable" verdict, please re-test
+> with v1.1.0+ once released. Do not rely on v1.0.0 verdicts.
+>
+> Tracking: GitHub issue #1. v1.1.0 in progress.
+
 [![Tests](https://github.com/bleedwatch/copy-fail-check/actions/workflows/test.yml/badge.svg)](https://github.com/bleedwatch/copy-fail-check/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](copy-fail-check.py)
