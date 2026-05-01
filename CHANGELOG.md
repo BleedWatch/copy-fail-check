@@ -2,6 +2,41 @@
 
 All notable changes to this project are documented in this file. The project follows semantic versioning.
 
+## [1.1.1] - 2026-05-01
+
+### Critical fix
+
+- Detect modules built into the kernel image (`CONFIG_CRYPTO_USER_API_AEAD=y`
+  rather than `=m`) by parsing `/lib/modules/<release>/modules.builtin`.
+  RHEL 8/9/10 ship `af_alg` and `algif_aead` as built-in, which means the
+  v1.0.0/v1.1.0 modprobe-based remediation was **silently inert** on those
+  distros. The verdict and recommendations now distinguish loadable from
+  built-in modules and refuse to claim `mitigated_modprobe` when the
+  modules cannot be blocked by `/etc/modprobe.d/`.
+- Detect Red Hat's official boot-arg mitigation by parsing `/proc/cmdline`
+  for `initcall_blacklist=algif_aead_init`, `initcall_blacklist=af_alg_init`,
+  or `initcall_blacklist=crypto_authenc_esn_module_init`. New verdict
+  `mitigated_initcall` (exit 3) returned when one of these is active.
+  Source: <https://access.redhat.com/security/cve/cve-2026-31431>.
+- `--remediate` now performs a pre-flight check and **refuses** to write a
+  modprobe mitigation file when the affected modules are built-in. Instead
+  it surfaces three actionable alternatives in `warnings`:
+  1. Reboot with `initcall_blacklist=...` boot arg (RHEL official).
+  2. Apply the vendor kernel update once available.
+  3. Deploy an eBPF LSM `socket_create` blocker for AF_ALG (no-reboot,
+     persistent via systemd) — references the lestercheung repo with the
+     caveat that its current `block_af_alg.c` is missing the trailing
+     `int ret` LSM hook arg and prior-return preservation.
+
+### Added
+
+- `module_provenance` and `kernel_boot_mitigation` blocks in the JSON/SARIF
+  output and in the human-readable report.
+- 7 new tests covering RHEL-style built-in detection, all three Red Hat
+  initcall_blacklist tokens, the `mitigated_initcall` verdict path, and the
+  guard that a "full" modprobe blacklist on a built-in kernel never produces
+  `mitigated_modprobe`.
+
 ## [1.1.0] - 2026-05-01
 
 ### Critical fix

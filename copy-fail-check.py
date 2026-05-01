@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timezone
 
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 TOOL_NAME = "copy-fail-check"
 REPOSITORY_URL = "https://github.com/bleedwatch/copy-fail-check"
 INFO_URI = REPOSITORY_URL
@@ -169,7 +169,12 @@ class CopyFailDetector:
             "af_alg_syscall": {"status": "unknown", "errno": None, "detail": None},
             "functional_test": {"status": "not_run", "detail": None},
             "modules_loaded": [],
+            "module_provenance": {"af_alg": "unknown", "algif_aead": "unknown",
+                                  "algif_skcipher": "unknown", "algif_hash": "unknown",
+                                  "algif_rng": "unknown", "any_builtin": False},
             "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
+            "kernel_boot_mitigation": {"initcall_blacklist": [], "blocks_copy_fail": False,
+                                       "source": None, "warnings": []},
             "kernel_patch": {"detected": False, "evidence": None, "weak_evidence": None},
         }
 
@@ -188,7 +193,9 @@ class CopyFailDetector:
 
         modules_loaded = self.list_loaded_modules()
         checks["modules_loaded"] = modules_loaded
+        checks["module_provenance"] = self.analyze_module_provenance(release)
         checks["modprobe_mitigation"] = self.analyze_modprobe()
+        checks["kernel_boot_mitigation"] = self.analyze_kernel_boot_mitigation(release)
         checks["kernel_patch"] = self.analyze_kernel_patch(os_info, release, proc_version)
         host["kernel"]["patch_status"] = "patched" if checks["kernel_patch"]["detected"] else "unverified"
 
@@ -308,6 +315,89 @@ class CopyFailDetector:
         else:
             completeness = "full"
         return {"present": bool(blocked), "files": files, "completeness": completeness, "warnings": warnings}
+
+    def analyze_module_provenance(self, release):
+        """Determine for each AF_ALG-related module whether it is built into
+        the kernel image (CONFIG=y) or loadable (CONFIG=m). Built-in modules
+        cannot be blocked by /etc/modprobe.d/* — modprobe is consulted only
+        for loadable modules. RHEL 8/9/10 ships af_alg and algif_aead as
+        built-in, so the v1.0.0/v1.1.0 modprobe-based remediation is inert
+        on those distros and a different mitigation path is required.
+
+        Sources, in order of authority:
+          1. /lib/modules/<release>/modules.builtin (kmod's authoritative
+             list of compiled-in modules, generated from kbuild).
+          2. /sys/module/<name> existence (the module is present in the
+             kernel, but this does not distinguish builtin from loaded).
+        """
+        result = {"af_alg": "unknown", "algif_aead": "unknown",
+                  "algif_skcipher": "unknown", "algif_hash": "unknown",
+                  "algif_rng": "unknown", "any_builtin": False, "source": None}
+
+        builtin_path = self.root_path("/lib/modules/{}/modules.builtin".format(release))
+        builtin_content = read_text(builtin_path, default="")
+        if builtin_content:
+            result["source"] = builtin_path
+            builtin_set = set()
+            for line in builtin_content.splitlines():
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                base = os.path.basename(stripped)
+                if base.endswith(".ko"):
+                    base = base[:-3]
+                builtin_set.add(module_name_from_proc(base))
+            for module in MODULES:
+                if module in builtin_set:
+                    result[module] = "builtin"
+
+        loaded = set(self.list_loaded_modules())
+        for module in MODULES:
+            if result[module] != "builtin":
+                if module in loaded:
+                    result[module] = "loaded_module"
+                else:
+                    sys_path = self.root_path("/sys/module/{}".format(module))
+                    if os.path.isdir(sys_path):
+                        sections = self.root_path("/sys/module/{}/sections".format(module))
+                        if not os.path.isdir(sections):
+                            result[module] = "builtin"
+                        else:
+                            result[module] = "loadable"
+                    elif builtin_content:
+                        result[module] = "loadable"
+
+        result["any_builtin"] = any(result[m] == "builtin" for m in MODULES)
+        return result
+
+    def analyze_kernel_boot_mitigation(self, release):
+        """Detect whether the running kernel was booted with one of the
+        Red Hat-recommended initcall_blacklist boot arguments that disable
+        the affected init paths. This is the only modprobe-equivalent
+        mitigation for distros where algif_aead is compiled in.
+
+        Recognized blacklist tokens (per access.redhat.com/security/cve/cve-2026-31431):
+          - algif_aead_init                 (specific affected module)
+          - af_alg_init                     (entire AF_ALG family)
+          - crypto_authenc_esn_module_init  (only the affected algorithm)
+        """
+        cmdline = read_text(self.root_path("/proc/cmdline"), default="").strip()
+        result = {"initcall_blacklist": [], "blocks_copy_fail": False,
+                  "source": "/proc/cmdline" if cmdline else None, "warnings": []}
+        if not cmdline:
+            return result
+        relevant = ("algif_aead_init", "af_alg_init", "crypto_authenc_esn_module_init")
+        found = []
+        for token in cmdline.split():
+            if not token.startswith("initcall_blacklist="):
+                continue
+            entries = token.split("=", 1)[1].split(",")
+            for entry in entries:
+                if entry in relevant:
+                    found.append(entry)
+        result["initcall_blacklist"] = found
+        result["blocks_copy_fail"] = bool(found)
+        return result
 
     def analyze_kernel_patch(self, os_info, release, proc_version):
         evidence = self.query_package_changelog(os_info, release)
@@ -575,21 +665,49 @@ class CopyFailDetector:
         patch = checks["kernel_patch"]
         af_alg = checks["af_alg_syscall"]
         functional = checks["functional_test"]
+        provenance = checks.get("module_provenance", {})
+        boot_mit = checks.get("kernel_boot_mitigation", {})
         loaded = set(checks["modules_loaded"])
         recommendations = []
 
+        any_builtin = bool(provenance.get("any_builtin"))
+        boot_blocks = bool(boot_mit.get("blocks_copy_fail"))
+
+        if any_builtin and not boot_blocks:
+            builtin_modules = [m for m in MODULES if provenance.get(m) == "builtin"]
+            recommendations.append(
+                "Modules built into this kernel ({}); modprobe blacklist is INERT on this system. "
+                "Reboot with one of: initcall_blacklist=algif_aead_init  /  "
+                "initcall_blacklist=af_alg_init  /  initcall_blacklist=crypto_authenc_esn_module_init "
+                "(see access.redhat.com/security/cve/cve-2026-31431). "
+                "For a no-reboot alternative, deploy an eBPF LSM blocker on socket_create denying family=AF_ALG."
+                .format(", ".join(builtin_modules))
+            )
         if loaded and mitigation["present"]:
             recommendations.append("Reboot to unload AF_ALG modules that were already resident before mitigation")
         if mitigation["completeness"] == "partial":
             recommendations.append("Complete modprobe mitigation for af_alg and algif_* modules")
 
         if functional["status"] == "modification_detected":
-            recommendations.append("Apply the vendor kernel update or run --remediate for immediate AF_ALG mitigation")
+            if any_builtin:
+                recommendations.append(
+                    "Apply the vendor kernel update; modprobe-based --remediate will NOT mitigate this host "
+                    "(modules are built-in). Use initcall_blacklist boot args or eBPF LSM as interim mitigation."
+                )
+            else:
+                recommendations.append("Apply the vendor kernel update or run --remediate for immediate AF_ALG mitigation")
             return ("vulnerable_confirmed_functional", True, EXIT_VULNERABLE,
                     "Vulnerable - functional sentinel test confirmed Copy Fail primitive landed marker in page cache",
                     recommendations)
 
-        if af_alg["status"] == "blocked" or mitigation["completeness"] == "full":
+        if boot_blocks:
+            recommendations.append("Install the vendor kernel update when available; keep boot mitigation in place")
+            return ("mitigated_initcall", False, EXIT_MITIGATED,
+                    "Vulnerable kernel exposure mitigated - boot arg disables affected initcall: {}".format(
+                        ", ".join(boot_mit.get("initcall_blacklist") or [])),
+                    recommendations)
+
+        if af_alg["status"] == "blocked" or (mitigation["completeness"] == "full" and not any_builtin):
             recommendations.append("Install the vendor kernel update when available; keep mitigation until reboot validation")
             return ("mitigated_modprobe", False, EXIT_MITIGATED,
                     "Vulnerable kernel exposure mitigated - AF_ALG blocked or fully disabled", recommendations)
@@ -681,6 +799,37 @@ class CopyFailRemediator:
         modprobe_dir = self.root_path("/etc/modprobe.d")
         if not os.path.isdir(modprobe_dir) or not os.access(modprobe_dir, os.W_OK):
             return EXIT_REMEDIATION_FAILED, "{} is not writable".format(modprobe_dir)
+
+        preflight_detector = CopyFailDetector(root=self.root, functional_test=False)
+        provenance = preflight_detector.analyze_module_provenance(platform.release())
+        builtin_modules = [m for m in MODULES if provenance.get(m) == "builtin"]
+        if builtin_modules:
+            self.warnings.append(
+                "Built-in modules detected: {}. Modprobe-based remediation is INERT on this kernel "
+                "and will not block AF_ALG. Refusing to write a misleading mitigation file. "
+                "Use one of the following alternatives:".format(", ".join(builtin_modules))
+            )
+            self.warnings.append(
+                "Boot args (reboot required, RHEL official): add to GRUB_CMDLINE_LINUX one of "
+                "'initcall_blacklist=algif_aead_init', 'initcall_blacklist=af_alg_init', or "
+                "'initcall_blacklist=crypto_authenc_esn_module_init', then run 'grub2-mkconfig -o "
+                "/boot/grub2/grub.cfg' (or update-grub on Debian-family) and reboot. See "
+                "access.redhat.com/security/cve/cve-2026-31431."
+            )
+            self.warnings.append(
+                "No-reboot eBPF LSM workaround (requires CONFIG_BPF_LSM=y and 'bpf' in "
+                "/sys/kernel/security/lsm): deploy a socket_create LSM hook that returns -EPERM for "
+                "family=AF_ALG. Reference implementation: github.com/lestercheung/linux-copy-fail-workarounds "
+                "(NOTE: at audit time, that block_af_alg.c lacks the trailing 'int ret' hook arg and "
+                "prior-return preservation, which can interfere with other BPF LSM programs in the chain — "
+                "review and patch the LSM signature before production deployment, and persist the link via "
+                "systemd or BPF pinning so the mitigation survives loader exit)."
+            )
+            return EXIT_REMEDIATION_FAILED, (
+                "Refusing modprobe remediation: af_alg/algif_aead are built into this kernel. "
+                "See warnings for the boot-arg and eBPF LSM alternatives."
+            )
+
         if not self.confirm():
             return EXIT_REMEDIATION_CANCELLED, "Remediation cancelled by user"
 
@@ -801,7 +950,8 @@ def make_sarif(result):
     verdict = result["verdict"]
     level = "error" if verdict["vulnerable"] else "warning" if verdict["exit_code"] == EXIT_MITIGATED else "note"
     results = []
-    if verdict["status"] in ("vulnerable_confirmed_functional", "unverified", "mitigated_modprobe"):
+    if verdict["status"] in ("vulnerable_confirmed_functional", "unverified",
+                              "mitigated_modprobe", "mitigated_initcall"):
         results.append({
             "ruleId": RULE_ID,
             "level": level,
@@ -878,10 +1028,21 @@ def make_human(result, use_color=True):
         "  Functional test: {}".format(checks["functional_test"]["status"]),
         "  Loaded modules: {}".format(", ".join(checks["modules_loaded"]) or "none detected"),
         "",
+        "Module Provenance (modprobe blacklist only works for 'loadable')",
+        "  af_alg: {}".format(checks.get("module_provenance", {}).get("af_alg", "unknown")),
+        "  algif_aead: {}".format(checks.get("module_provenance", {}).get("algif_aead", "unknown")),
+        "  Any built-in: {}".format(str(checks.get("module_provenance", {}).get("any_builtin", False)).lower()),
+        "",
         "Modprobe Mitigation",
         "  Present: {}".format(str(checks["modprobe_mitigation"]["present"]).lower()),
         "  Completeness: {}".format(checks["modprobe_mitigation"]["completeness"]),
         "  Files: {}".format(", ".join(checks["modprobe_mitigation"]["files"]) or "none"),
+        "",
+        "Kernel Boot Mitigation (RHEL official, requires reboot)",
+        "  initcall_blacklist tokens: {}".format(
+            ", ".join(checks.get("kernel_boot_mitigation", {}).get("initcall_blacklist", []) or []) or "none"),
+        "  Blocks Copy Fail: {}".format(
+            str(checks.get("kernel_boot_mitigation", {}).get("blocks_copy_fail", False)).lower()),
         "",
         "Verdict",
         "  {}".format(colorize(verdict["summary"], verdict_color, use_color)),

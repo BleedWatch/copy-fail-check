@@ -1,13 +1,18 @@
 # copy-fail-check: CVE-2026-31431 Copy Fail Detection and Remediation
 
-> **⚠️ v1.0.0 yanked — upgrade to v1.1.0+**
+> **⚠️ v1.0.0 yanked — upgrade to v1.1.1+**
 >
 > v1.0.0 produced false negatives on Fedora and similar distros (kernel
 > mainline-version heuristic + an incomplete functional test that never
-> drove the AF_ALG primitive). v1.1.0 ships the full sendmsg + splice +
-> recv chain, drops the version heuristic, and reports `UNVERIFIED` rather
-> than `PATCHED` whenever authoritative evidence is missing. See the
-> [CHANGELOG](CHANGELOG.md#110---2026-05-01) and
+> drove the AF_ALG primitive). v1.1.0 shipped the full sendmsg + splice +
+> recv chain, dropped the version heuristic, and reports `UNVERIFIED`
+> rather than `PATCHED` whenever authoritative evidence is missing. v1.1.1
+> closes a follow-up gap on RHEL 8/9/10 where `algif_aead` is **compiled
+> into the kernel** (CONFIG=y), making any modprobe-based mitigation
+> silently inert. v1.1.1 detects built-in modules, refuses misleading
+> modprobe remediation, and recognizes Red Hat's official
+> `initcall_blacklist=` boot-arg mitigation. See the
+> [CHANGELOG](CHANGELOG.md) and
 > [issue #1](https://github.com/BleedWatch/copy-fail-check/issues/1) for
 > the full root-cause analysis.
 
@@ -129,7 +134,8 @@ Ansible:
 | --- | --- | --- |
 | `0` | `patched` | Functional test reported no modification AND authoritative changelog evidence (rpm/apt) confirms the fix |
 | `2` | `vulnerable_confirmed_functional` | Functional test detected the 4-byte controlled write — kernel is vulnerable (priority over all other signals) |
-| `3` | `mitigated_modprobe` | AF_ALG syscall blocked by modprobe blacklist or `install /bin/false` |
+| `3` | `mitigated_modprobe` | AF_ALG syscall blocked by modprobe blacklist or `install /bin/false` (only valid when modules are loadable, not built-in) |
+| `3` | `mitigated_initcall` | Kernel booted with `initcall_blacklist=algif_aead_init` / `af_alg_init` / `crypto_authenc_esn_module_init` (Red Hat official mitigation for kernels with built-in `algif_aead`) |
 | `10` | `detection_error` | AF_ALG syscall returned an unexpected error; detection inconclusive |
 | `11` | `unverified` | Functional test reported no modification but no authoritative changelog evidence — **never trust as patched without manual verification** |
 | `11` | runtime_error | Unsupported environment (non-Linux, missing /proc, unsupported distro, Python < 3.8) |
@@ -146,6 +152,26 @@ The detector combines four signals:
 4. **Modprobe blacklist / install `/bin/false`** directives in `/etc/modprobe.d/`.
 
 The sentinel is created with `O_CREAT|O_EXCL|O_NOFOLLOW` at `0600`, named with PID + nanosecond timestamp + 8 random bytes. Cleanup is guaranteed via `atexit` and signal handlers (SIGINT/SIGTERM). The functional test never opens, reads, writes, or unlinks any file outside `/tmp/`. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full rationale.
+
+## RHEL / Built-in Modules
+
+RHEL 8/9/10 (and most enterprise rebuilds — Alma, Rocky) ship `af_alg` and `algif_aead` **compiled into the kernel image** (`CONFIG_CRYPTO_USER_API_AEAD=y`). On those systems the modprobe blacklist approach is silently ignored by the kernel — `/etc/modprobe.d/` is consulted only for loadable modules. The detector parses `/lib/modules/<release>/modules.builtin` to identify this case and reports it under `module_provenance`.
+
+When built-in modules are detected, three mitigation paths are available:
+
+1. **Kernel boot argument (Red Hat official, requires reboot)** — append one of the following to `GRUB_CMDLINE_LINUX` and run `grub2-mkconfig -o /boot/grub2/grub.cfg` (or `update-grub` on Debian-family):
+   ```
+   initcall_blacklist=algif_aead_init               # block only the affected algif backend
+   initcall_blacklist=af_alg_init                   # block AF_ALG entirely (broader)
+   initcall_blacklist=crypto_authenc_esn_module_init # block only the affected algorithm
+   ```
+   Reference: <https://access.redhat.com/security/cve/cve-2026-31431>. The detector recognizes any of these tokens in `/proc/cmdline` and returns `mitigated_initcall` (exit 3).
+
+2. **Vendor kernel update** — once Red Hat ships the backport for the running RHEL stream, apply it via `dnf update kernel` and reboot. The detector's changelog probe will pick up the fix automatically.
+
+3. **eBPF LSM blocker (no reboot, requires `CONFIG_BPF_LSM=y` and `bpf` in `/sys/kernel/security/lsm`)** — deploy a `socket_create` LSM hook that returns `-EPERM` for `family=AF_ALG`. A reference implementation lives at <https://github.com/lestercheung/linux-copy-fail-workarounds>. **Caveat:** at the time of this audit (2026-05-01), `block_af_alg.c` in that repo omits the trailing `int ret` argument from the BPF LSM hook signature and does not preserve prior denials, which can interfere with other BPF LSM programs in the chain. Patch the hook signature before production deployment, persist the link via systemd or BPF pinning so the mitigation survives loader exit.
+
+`copy-fail-check --remediate` performs a pre-flight check and refuses to write a misleading modprobe file when the modules are built-in, instead emitting these three options as remediation `warnings`.
 
 ## Why This Tool Exists
 

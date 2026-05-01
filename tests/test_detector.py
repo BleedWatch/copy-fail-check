@@ -187,6 +187,106 @@ class DetectorTests(unittest.TestCase):
                                      "release {} alone must not yield detected=True".format(release))
                     self.assertIsNone(result["evidence"])
 
+    def test_module_provenance_detects_builtin_from_modules_builtin_file(self):
+        """RHEL 8/9/10 ship af_alg/algif_aead built into the kernel (CONFIG=y).
+        modules.builtin lists them; modprobe blacklist is then inert."""
+        with self.make_root('ID=rhel\nVERSION_ID="9"\nID_LIKE="fedora"\n') as root:
+            release = "5.14.0-503.el9.x86_64"
+            mod_dir = os.path.join(root, "lib", "modules", release)
+            os.makedirs(mod_dir, exist_ok=True)
+            with open(os.path.join(mod_dir, "modules.builtin"), "w") as f:
+                f.write("kernel/crypto/af_alg.ko\n")
+                f.write("kernel/crypto/algif_aead.ko\n")
+                f.write("kernel/crypto/algif_skcipher.ko\n")
+                f.write("kernel/fs/ext4/ext4.ko\n")
+            detector = cfc.CopyFailDetector(root=root, functional_test=False)
+            prov = detector.analyze_module_provenance(release)
+            self.assertEqual(prov["af_alg"], "builtin")
+            self.assertEqual(prov["algif_aead"], "builtin")
+            self.assertEqual(prov["algif_skcipher"], "builtin")
+            self.assertTrue(prov["any_builtin"])
+
+    def test_module_provenance_unknown_when_modules_builtin_missing(self):
+        with self.make_root('ID=ubuntu\nVERSION_ID="24.04"\nID_LIKE=debian\n') as root:
+            detector = cfc.CopyFailDetector(root=root, functional_test=False)
+            prov = detector.analyze_module_provenance("6.6.0-fake")
+            self.assertFalse(prov["any_builtin"])
+            for module in cfc.MODULES:
+                self.assertIn(prov[module], ("unknown", "loaded_module"))
+
+    def test_kernel_boot_mitigation_detects_initcall_blacklist(self):
+        with self.make_root('ID=rhel\nVERSION_ID="9"\n') as root:
+            with open(os.path.join(root, "proc", "cmdline"), "w") as f:
+                f.write("BOOT_IMAGE=/vmlinuz ro initcall_blacklist=algif_aead_init quiet\n")
+            detector = cfc.CopyFailDetector(root=root, functional_test=False)
+            mit = detector.analyze_kernel_boot_mitigation("5.14.0")
+            self.assertTrue(mit["blocks_copy_fail"])
+            self.assertIn("algif_aead_init", mit["initcall_blacklist"])
+
+    def test_kernel_boot_mitigation_recognizes_all_three_redhat_tokens(self):
+        with self.make_root('ID=rhel\n') as root:
+            for token in ("algif_aead_init", "af_alg_init", "crypto_authenc_esn_module_init"):
+                with self.subTest(token=token):
+                    with open(os.path.join(root, "proc", "cmdline"), "w") as f:
+                        f.write("ro initcall_blacklist={}\n".format(token))
+                    detector = cfc.CopyFailDetector(root=root, functional_test=False)
+                    mit = detector.analyze_kernel_boot_mitigation("5.14.0")
+                    self.assertTrue(mit["blocks_copy_fail"], "token {} not recognized".format(token))
+
+    def test_kernel_boot_mitigation_ignores_unrelated_initcall_blacklist(self):
+        with self.make_root('ID=rhel\n') as root:
+            with open(os.path.join(root, "proc", "cmdline"), "w") as f:
+                f.write("ro initcall_blacklist=some_other_init quiet\n")
+            detector = cfc.CopyFailDetector(root=root, functional_test=False)
+            mit = detector.analyze_kernel_boot_mitigation("5.14.0")
+            self.assertFalse(mit["blocks_copy_fail"])
+            self.assertEqual(mit["initcall_blacklist"], [])
+
+    def test_verdict_builtin_with_initcall_blacklist_emits_mitigated_initcall(self):
+        detector = cfc.CopyFailDetector(functional_test=False)
+        host = {"kernel": {"patch_status": "unverified"}}
+        checks = {
+            "af_alg_syscall": {"status": "accessible"},
+            "functional_test": {"status": "no_modification", "detail": "primitive blocked"},
+            "modules_loaded": [],
+            "module_provenance": {m: ("builtin" if m in ("af_alg", "algif_aead") else "unknown")
+                                  for m in cfc.MODULES},
+            "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
+            "kernel_boot_mitigation": {"initcall_blacklist": ["algif_aead_init"],
+                                       "blocks_copy_fail": True, "source": "/proc/cmdline", "warnings": []},
+            "kernel_patch": {"detected": False, "evidence": None, "weak_evidence": None},
+        }
+        checks["module_provenance"]["any_builtin"] = True
+        status, vulnerable, code, summary, _ = detector.verdict(host, checks)
+        self.assertEqual(code, cfc.EXIT_MITIGATED)
+        self.assertEqual(status, "mitigated_initcall")
+        self.assertIn("algif_aead_init", summary)
+
+    def test_verdict_modprobe_full_with_builtin_does_not_claim_mitigated(self):
+        """A full modprobe blacklist on a kernel where the modules are
+        compiled in must NOT be reported as mitigated — modprobe doesn't
+        apply to built-in code."""
+        detector = cfc.CopyFailDetector(functional_test=False)
+        host = {"kernel": {"patch_status": "unverified"}}
+        checks = {
+            "af_alg_syscall": {"status": "accessible"},
+            "functional_test": {"status": "no_modification"},
+            "modules_loaded": [],
+            "module_provenance": {m: "builtin" for m in cfc.MODULES},
+            "modprobe_mitigation": {"present": True, "files": ["/etc/modprobe.d/disable.conf"],
+                                    "completeness": "full", "warnings": []},
+            "kernel_boot_mitigation": {"initcall_blacklist": [], "blocks_copy_fail": False,
+                                       "source": "/proc/cmdline", "warnings": []},
+            "kernel_patch": {"detected": False, "evidence": None, "weak_evidence": None},
+        }
+        checks["module_provenance"]["any_builtin"] = True
+        status, _, code, _, recs = detector.verdict(host, checks)
+        self.assertNotEqual(status, "mitigated_modprobe")
+        self.assertNotEqual(code, cfc.EXIT_MITIGATED)
+        joined = " ".join(recs)
+        self.assertIn("INERT", joined)
+        self.assertIn("initcall_blacklist", joined)
+
     def test_query_package_changelog_uses_kernel_core_on_fedora(self):
         captured = []
 
