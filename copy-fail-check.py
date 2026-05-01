@@ -407,9 +407,12 @@ class CopyFailDetector:
             os.lseek(state["fd"], 0, os.SEEK_SET)
             after = os.read(state["fd"], len(pattern))
             if after != pattern:
-                detail = "sentinel page cache modified by Copy Fail primitive"
+                diffs = [(i, pattern[i], after[i]) for i in range(len(pattern)) if pattern[i] != after[i]]
+                first_offset = diffs[0][0] if diffs else 0
+                detail = ("sentinel page cache modified by Copy Fail primitive "
+                          "at offset {} ({} byte(s) altered)").format(first_offset, len(diffs))
                 if primitive["status"] == "attempted":
-                    detail += " (full sendmsg+splice+recv chain executed)"
+                    detail += "; full sendmsg+splice+recv chain executed"
                 return {"status": "modification_detected", "detail": detail}
             if primitive["status"] == "attempted":
                 return {"status": "no_modification",
