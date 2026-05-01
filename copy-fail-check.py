@@ -325,15 +325,19 @@ class CopyFailDetector:
     def query_package_changelog(self, os_info, release):
         family = distro_family(os_info)
         commands = []
+        # Each query is pinned to the running kernel release so we never
+        # surface the changelog of a freshly-installed-but-not-yet-booted
+        # patched package while the host is still running an older
+        # vulnerable kernel.
         if family == "debian" and shutil.which("apt"):
             commands.append(["apt", "changelog", "linux-image-{}".format(release)])
         elif family == "rhel" and shutil.which("rpm"):
             if os_info.get("ID", "").lower() == "fedora":
-                commands.append(["rpm", "-q", "--changelog", "kernel-core"])
-            commands.append(["rpm", "-q", "--changelog", "kernel"])
+                commands.append(["rpm", "-q", "--changelog", "kernel-core-{}".format(release)])
+            commands.append(["rpm", "-q", "--changelog", "kernel-{}".format(release)])
         elif family == "suse" and shutil.which("rpm"):
-            commands.append(["rpm", "-q", "--changelog", "kernel-default"])
-            commands.append(["rpm", "-q", "--changelog", "kernel"])
+            commands.append(["rpm", "-q", "--changelog", "kernel-default-{}".format(release)])
+            commands.append(["rpm", "-q", "--changelog", "kernel-{}".format(release)])
         for command in commands:
             try:
                 completed = subprocess.run(command, check=False, timeout=60, capture_output=True, text=True)
@@ -351,7 +355,8 @@ class CopyFailDetector:
 
     def run_functional_test(self):
         path = self.make_sentinel_path()
-        assert path.startswith("/tmp/")
+        if not path.startswith(self.tmp_dir.rstrip("/") + "/"):
+            return {"status": "setup_failed", "detail": "sentinel path outside configured tmp_dir"}
         flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -455,7 +460,10 @@ class CopyFailDetector:
           - "setup_failed":   AF_ALG/key/accept/sendmsg/splice setup failed
           - "error":          unexpected failure
         """
-        assert sentinel_path.startswith("/tmp/")
+        expected_prefix = self.tmp_dir.rstrip("/") + "/"
+        if not sentinel_path.startswith(expected_prefix):
+            return {"status": "setup_failed",
+                    "detail": "refusing to operate outside tmp_dir ({})".format(self.tmp_dir)}
         if not hasattr(socket, "AF_ALG"):
             return {"status": "setup_failed",
                     "detail": "Python build has no socket.AF_ALG"}

@@ -205,8 +205,12 @@ class DetectorTests(unittest.TestCase):
                 "6.19.12-200.fc43.x86_64",
             )
         rpm_targets = [cmd[-1] for cmd in captured]
-        self.assertIn("kernel-core", rpm_targets)
-        self.assertEqual(rpm_targets[0], "kernel-core")
+        self.assertTrue(any(t.startswith("kernel-core-") for t in rpm_targets),
+                        "expected kernel-core-<release> probe, got {}".format(rpm_targets))
+        self.assertTrue(rpm_targets[0].startswith("kernel-core-"),
+                        "kernel-core probe must come first, got {}".format(rpm_targets))
+        # release must be embedded so we never surface a different package's changelog
+        self.assertIn("6.19.12-200.fc43.x86_64", rpm_targets[0])
 
     def test_json_and_sarif_are_parseable(self):
         result = {
