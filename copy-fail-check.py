@@ -586,6 +586,12 @@ class CopyFailDetector:
             return ("mitigated_modprobe", False, EXIT_MITIGATED,
                     "Vulnerable kernel exposure mitigated - AF_ALG blocked or fully disabled", recommendations)
 
+        if af_alg["status"] not in ("accessible",):
+            recommendations.append("Re-run on the host (not inside a restricted container) and with root privileges")
+            return ("detection_error", True, EXIT_DETECTION_ERROR,
+                    "Detection inconclusive - AF_ALG syscall check returned status '{}'".format(af_alg["status"]),
+                    recommendations)
+
         if functional["status"] == "no_modification":
             if patch["detected"]:
                 if mitigation["present"] and loaded:
