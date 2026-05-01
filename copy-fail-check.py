@@ -33,13 +33,13 @@ AUDIT_LOG = "/var/log/bleedwatch-copy-fail-mitigation.log"
 MITIGATION_FILE = "/etc/modprobe.d/disable-af-alg.conf"
 MODULES = ("af_alg", "algif_aead", "algif_skcipher", "algif_hash", "algif_rng")
 ALGIF_MODULES = ("algif_aead", "algif_skcipher", "algif_hash", "algif_rng")
-LAST_UNFIXED_MAINLINE = (6, 14, 99)
 PATCH_COMMIT = "a664bf3d603d"
 
 EXIT_SAFE = 0
 EXIT_VULNERABLE = 2
 EXIT_MITIGATED = 3
 EXIT_DETECTION_ERROR = 10
+EXIT_UNVERIFIED = 11
 EXIT_RUNTIME_ERROR = 11
 EXIT_REMEDIATED = 20
 EXIT_REMEDIATION_CANCELLED = 21
@@ -79,26 +79,6 @@ def parse_os_release_content(content):
     return result
 
 
-def kernel_tuple(release):
-    parts = []
-    current = ""
-    for char in release:
-        if char.isdigit():
-            current += char
-        elif current:
-            parts.append(int(current))
-            current = ""
-            if len(parts) == 3:
-                break
-        elif parts:
-            break
-    if current and len(parts) < 3:
-        parts.append(int(current))
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3])
-
-
 def module_name_from_proc(name):
     return name.replace("-", "_")
 
@@ -124,7 +104,7 @@ def colorize(text, color, enabled):
 
 
 class CopyFailDetector:
-    def __init__(self, root="/", tmp_dir="/tmp", functional_test=True, deep_patch_check=False):
+    def __init__(self, root="/", tmp_dir="/tmp", functional_test=True, deep_patch_check=True):
         self.root = root
         self.tmp_dir = tmp_dir
         self.functional_test = functional_test
@@ -294,12 +274,9 @@ class CopyFailDetector:
         for token in evidence_tokens:
             if token.lower() in haystack:
                 return {"detected": True, "evidence": "kernel metadata references {}".format(token)}
-        if kernel_tuple(release) > LAST_UNFIXED_MAINLINE:
-            return {"detected": True, "evidence": "mainline kernel version is newer than last known unfixed range"}
-        if self.deep_patch_check:
-            evidence = self.query_package_changelog(os_info, release)
-            if evidence:
-                return {"detected": True, "evidence": evidence}
+        evidence = self.query_package_changelog(os_info, release)
+        if evidence:
+            return {"detected": True, "evidence": evidence}
         return {"detected": False, "evidence": None}
 
     def query_package_changelog(self, os_info, release):
@@ -308,9 +285,12 @@ class CopyFailDetector:
         if family == "debian" and shutil.which("apt"):
             commands.append(["apt", "changelog", "linux-image-{}".format(release)])
         elif family == "rhel" and shutil.which("rpm"):
+            if os_info.get("ID", "").lower() == "fedora":
+                commands.append(["rpm", "-q", "--changelog", "kernel-core"])
             commands.append(["rpm", "-q", "--changelog", "kernel"])
         elif family == "suse" and shutil.which("rpm"):
             commands.append(["rpm", "-q", "--changelog", "kernel-default"])
+            commands.append(["rpm", "-q", "--changelog", "kernel"])
         for command in commands:
             try:
                 completed = subprocess.run(command, check=False, timeout=60, capture_output=True, text=True)
@@ -440,23 +420,44 @@ class CopyFailDetector:
         if functional["status"] == "modification_detected":
             recommendations.append("Apply the vendor kernel update or run --remediate for immediate AF_ALG mitigation")
             return ("vulnerable_confirmed_functional", True, EXIT_VULNERABLE,
-                    "Vulnerable - functional sentinel test detected page cache modification", recommendations)
-
-        if patch["detected"]:
-            if mitigation["present"] and loaded:
-                recommendations.append("Reboot when practical so loaded AF_ALG modules match boot-time policy")
-            return ("patched", False, EXIT_SAFE, "Non vulnerable - kernel patch evidence detected", recommendations)
+                    "Vulnerable - functional sentinel test confirmed Copy Fail primitive landed marker in page cache",
+                    recommendations)
 
         if af_alg["status"] == "blocked" or mitigation["completeness"] == "full":
             recommendations.append("Install the vendor kernel update when available; keep mitigation until reboot validation")
             return ("mitigated_modprobe", False, EXIT_MITIGATED,
                     "Vulnerable kernel exposure mitigated - AF_ALG blocked or fully disabled", recommendations)
 
-        if af_alg["status"] == "accessible":
-            recommendations.append("Patch the kernel or run sudo python3 copy-fail-check.py --remediate")
-            recommendations.append("Avoid relying on containers as a boundary for shared-kernel workloads")
-            return ("vulnerable_inferred_kernel", True, EXIT_VULNERABLE,
-                    "Vulnerable inferred - AF_ALG accessible and patch evidence not found", recommendations)
+        if functional["status"] == "no_modification":
+            if patch["detected"]:
+                if mitigation["present"] and loaded:
+                    recommendations.append("Reboot when practical so loaded AF_ALG modules match boot-time policy")
+                return ("patched", False, EXIT_SAFE,
+                        "Non vulnerable - kernel patch evidence found in changelog (authoritative) and functional test confirmed primitive blocked",
+                        recommendations)
+            recommendations.append("Verify the kernel against the vendor advisory before trusting this verdict")
+            recommendations.append("Apply the vendor kernel update or run sudo python3 copy-fail-check.py --remediate")
+            return ("unverified", False, EXIT_UNVERIFIED,
+                    "Unverified - functional test reported no modification but no authoritative patch evidence was found; do not trust this as patched",
+                    recommendations)
+
+        if functional["status"] == "setup_failed":
+            recommendations.append("Re-run as root; the functional Copy Fail primitive could not be set up in this environment")
+            recommendations.append("If kernel changelog evidence is present, treat as likely patched; otherwise treat as unverified")
+            detail = functional.get("detail") or "unknown"
+            return ("unverified", False, EXIT_UNVERIFIED,
+                    "Unverified - functional test setup failed ({}); cannot confirm or deny exposure".format(detail),
+                    recommendations)
+
+        if functional["status"] == "not_run" and patch["detected"]:
+            return ("patched", False, EXIT_SAFE,
+                    "Non vulnerable - kernel patch evidence found in changelog (authoritative)", recommendations)
+
+        if functional["status"] == "not_run":
+            recommendations.append("Re-run without --verify to execute the functional Copy Fail primitive test")
+            return ("unverified", False, EXIT_UNVERIFIED,
+                    "Unverified - functional test was not executed and no authoritative patch evidence was found",
+                    recommendations)
 
         recommendations.append("Re-run with --audit on the host, not inside a restricted container")
         return ("detection_error", True, EXIT_DETECTION_ERROR,
@@ -628,7 +629,7 @@ def make_sarif(result):
     verdict = result["verdict"]
     level = "error" if verdict["vulnerable"] else "warning" if verdict["exit_code"] == EXIT_MITIGATED else "note"
     results = []
-    if verdict["status"] in ("vulnerable_confirmed_functional", "vulnerable_inferred_kernel", "mitigated_modprobe"):
+    if verdict["status"] in ("vulnerable_confirmed_functional", "unverified", "mitigated_modprobe"):
         results.append({
             "ruleId": RULE_ID,
             "level": level,
@@ -786,7 +787,7 @@ def main(argv=None):
                 emit_output("\n".join(lines) + "\n", args.output_file)
         return code
 
-    detector = CopyFailDetector(functional_test=not args.verify, deep_patch_check=args.audit)
+    detector = CopyFailDetector(functional_test=not args.verify, deep_patch_check=True)
     result = detector.detect()
     if not args.quiet:
         if args.json:
