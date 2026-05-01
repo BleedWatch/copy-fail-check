@@ -1,20 +1,15 @@
 # copy-fail-check: CVE-2026-31431 Copy Fail Detection and Remediation
 
-> **⚠️ ADVISORY — v1.0.0 yanked**
+> **⚠️ v1.0.0 yanked — upgrade to v1.1.0+**
 >
-> Version 1.0.0 can incorrectly report "Non vulnerable" by inferring
-> patch status from the kernel mainline version rather than from
-> verified fix evidence. This affects Fedora and any distro running
-> stable kernel branches below 7.0-rc7 unless the vendor fix or
-> backport is explicitly confirmed. Independently of that heuristic,
-> the v1.0.0 functional test is also incomplete and never executes
-> the full Copy Fail primitive (sendmsg + splice + recv), so it
-> returns "no_modification" on every kernel regardless of state.
->
-> **Distrust every v1.0.0 "Non vulnerable" verdict** unless it has
-> been independently verified. Re-test with v1.1.0+ once released.
->
-> Tracking: GitHub issue #1. v1.1.0 in progress.
+> v1.0.0 produced false negatives on Fedora and similar distros (kernel
+> mainline-version heuristic + an incomplete functional test that never
+> drove the AF_ALG primitive). v1.1.0 ships the full sendmsg + splice +
+> recv chain, drops the version heuristic, and reports `UNVERIFIED` rather
+> than `PATCHED` whenever authoritative evidence is missing. See the
+> [CHANGELOG](CHANGELOG.md#110---2026-05-01) and
+> [issue #1](https://github.com/BleedWatch/copy-fail-check/issues/1) for
+> the full root-cause analysis.
 
 [![Tests](https://github.com/bleedwatch/copy-fail-check/actions/workflows/test.yml/badge.svg)](https://github.com/bleedwatch/copy-fail-check/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -128,9 +123,29 @@ Ansible:
 | SUSE | SLES/openSUSE 15+ | Supported | `dracut -f` or `mkinitrd` |
 | Amazon Linux | 2, 2023 | Supported | `dracut -f` |
 
+## Verdict and Exit Codes
+
+| Exit | Verdict status | Meaning |
+| --- | --- | --- |
+| `0` | `patched` | Functional test reported no modification AND authoritative changelog evidence (rpm/apt) confirms the fix |
+| `2` | `vulnerable_confirmed_functional` | Functional test detected the 4-byte controlled write — kernel is vulnerable (priority over all other signals) |
+| `3` | `mitigated_modprobe` | AF_ALG syscall blocked by modprobe blacklist or `install /bin/false` |
+| `10` | `detection_error` | AF_ALG syscall returned an unexpected error; detection inconclusive |
+| `11` | `unverified` | Functional test reported no modification but no authoritative changelog evidence — **never trust as patched without manual verification** |
+| `11` | runtime_error | Unsupported environment (non-Linux, missing /proc, unsupported distro, Python < 3.8) |
+
+Exit `11` covers both `unverified` and runtime errors; the `verdict.status` field in JSON output carries the precise distinction. Both indicate "non-conclusive, please re-investigate".
+
 ## Detection Methodology
 
-The detector combines four signals: kernel patch evidence (parsed from `/proc/version`, `uname`, and optional package changelogs), AF_ALG socket reachability, currently loaded `algif_*` modules, and modprobe blacklist or `install ... /bin/false` directives. The functional sentinel test only verifies that the AF_ALG `authencesn` primitive can be created and bound on a self-owned `/tmp/` file; it deliberately does **not** ship a weaponised splice payload that would trigger the actual page cache write. This avoids redistributing a working LPE primitive while still allowing the verdict logic to flag a host as `vulnerable_inferred_kernel` (exit code `2`) whenever AF_ALG is reachable and no patch evidence is found. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full rationale.
+The detector combines four signals:
+
+1. **Functional Copy Fail primitive** (priority): runs the full AF_ALG `authencesn(hmac(sha1),cbc(aes))` chain — `ALG_SET_KEY` with rtattr-wrapped authenc key, `accept` op socket, `sendmsg(MSG_MORE)` with controlled AAD, `splice(sentinel → pipe → op socket)`, then `recv()` to drive the in-place AEAD decrypt — against a caller-owned 4 KiB sentinel under `/tmp/`. On vulnerable kernels the buggy 4-byte scratch write lands inside the spliced page cache; the tool detects the byte difference and reports the offset (typically offset 12). On patched kernels the in-place destination is rejected before the copyback and the page cache is left strictly unchanged.
+2. **Authoritative kernel changelog** parsed from `rpm -q --changelog kernel-core` (Fedora), `rpm -q --changelog kernel` (RHEL/CentOS/Alma/Rocky/Amazon Linux), `rpm -q --changelog kernel-default` (SUSE), or `apt changelog linux-image-<release>` (Debian/Ubuntu) — only this evidence drives a `patched` verdict.
+3. **AF_ALG syscall reachability** (with EAFNOSUPPORT meaning blocked → exit 3 mitigated).
+4. **Modprobe blacklist / install `/bin/false`** directives in `/etc/modprobe.d/`.
+
+The sentinel is created with `O_CREAT|O_EXCL|O_NOFOLLOW` at `0600`, named with PID + nanosecond timestamp + 8 random bytes. Cleanup is guaranteed via `atexit` and signal handlers (SIGINT/SIGTERM). The functional test never opens, reads, writes, or unlinks any file outside `/tmp/`. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full rationale.
 
 ## Why This Tool Exists
 

@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timezone
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TOOL_NAME = "copy-fail-check"
 REPOSITORY_URL = "https://github.com/bleedwatch/copy-fail-check"
 INFO_URI = REPOSITORY_URL
