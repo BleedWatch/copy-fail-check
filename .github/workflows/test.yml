@@ -71,3 +71,65 @@ jobs:
 
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
+
+      - name: Verdict must not be falsely 'patched' without authoritative evidence
+        run: |
+          python3 copy-fail-check.py --check --json > /tmp/result.json || true
+          python3 -c "
+          import json, sys
+          d = json.load(open('/tmp/result.json'))
+          v = d['verdict']
+          ec = v['exit_code']
+          status = v['status']
+          assert ec in (0, 2, 3, 10, 11), 'unexpected exit {}'.format(ec)
+          if status == 'patched':
+              ev = d['checks']['kernel_patch']['evidence']
+              assert ev and 'changelog' in ev.lower(), 'patched verdict without authoritative changelog evidence: {}'.format(d)
+          print('verdict guard OK: status={} exit={}'.format(status, ec))
+          "
+
+  fedora:
+    name: Fedora ${{ matrix.version }} / system Python
+    runs-on: ubuntu-24.04
+    container: fedora:${{ matrix.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["43"]
+    steps:
+      - name: Prepare container
+        run: |
+          dnf -y install --setopt=install_weak_deps=False git python3 ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Version smoke test
+        run: python3 copy-fail-check.py --version
+
+      - name: JSON smoke test
+        run: python3 copy-fail-check.py --check --json | python3 -m json.tool >/dev/null
+
+      - name: SARIF smoke test
+        run: python3 copy-fail-check.py --check --sarif | python3 -m json.tool >/dev/null
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Verdict must not regress to v1.0.0 false negative on Fedora
+        run: |
+          python3 copy-fail-check.py --check --json > /tmp/result.json || true
+          python3 -c "
+          import json, sys
+          d = json.load(open('/tmp/result.json'))
+          v = d['verdict']
+          ec = v['exit_code']
+          status = v['status']
+          assert ec in (0, 2, 3, 10, 11), 'unexpected exit {}'.format(ec)
+          # On Fedora, the v1.0.0 bug reported 'patched' with mainline-version
+          # heuristic and no changelog probe of kernel-core. Guard against that.
+          if status == 'patched':
+              ev = d['checks']['kernel_patch']['evidence']
+              assert ev and 'changelog' in ev.lower(), 'patched without authoritative changelog evidence: {}'.format(d)
+          print('Fedora verdict guard OK: status={} exit={}'.format(status, ec))
+          "

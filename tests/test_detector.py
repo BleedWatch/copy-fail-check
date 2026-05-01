@@ -86,31 +86,131 @@ class DetectorTests(unittest.TestCase):
         if os.path.exists(sentinel):
             os.unlink(sentinel)
         detector.make_sentinel_path = lambda: sentinel
-        detector.attempt_copy_fail_primitive = mock.Mock(side_effect=OSError(errno.EPERM, "blocked"))
+        detector.execute_copy_fail_primitive = mock.Mock(side_effect=OSError(errno.EPERM, "blocked"))
         result = detector.run_functional_test()
-        self.assertEqual(result["status"], "setup_failed")
+        self.assertIn(result["status"], ("error", "setup_failed"))
         self.assertFalse(os.path.exists(sentinel))
 
-    def test_verdict_exit_codes(self):
+    def test_verdict_modification_detected_is_vulnerable_priority(self):
+        detector = cfc.CopyFailDetector(functional_test=False)
+        host = {"kernel": {"patch_status": "patched"}}
+        checks = {
+            "af_alg_syscall": {"status": "accessible"},
+            "functional_test": {"status": "modification_detected", "detail": "marker landed"},
+            "modules_loaded": [],
+            "modprobe_mitigation": {"present": True, "files": [], "completeness": "full", "warnings": []},
+            "kernel_patch": {"detected": True, "evidence": "changelog references CVE", "weak_evidence": None},
+        }
+        status, vulnerable, code, _, _ = detector.verdict(host, checks)
+        self.assertEqual(code, cfc.EXIT_VULNERABLE)
+        self.assertEqual(status, "vulnerable_confirmed_functional")
+        self.assertTrue(vulnerable)
+
+    def test_verdict_no_modification_without_evidence_is_unverified_not_patched(self):
         detector = cfc.CopyFailDetector(functional_test=False)
         host = {"kernel": {"patch_status": "unverified"}}
-        base_checks = {
+        checks = {
             "af_alg_syscall": {"status": "accessible"},
+            "functional_test": {"status": "no_modification", "detail": "primitive ran"},
+            "modules_loaded": [],
+            "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
+            "kernel_patch": {"detected": False, "evidence": None, "weak_evidence": None},
+        }
+        status, vulnerable, code, summary, _ = detector.verdict(host, checks)
+        self.assertEqual(code, cfc.EXIT_UNVERIFIED)
+        self.assertEqual(status, "unverified")
+        self.assertFalse(vulnerable)
+        self.assertIn("unverified", summary.lower())
+        self.assertNotIn("non vulnerable", summary.lower())
+
+    def test_verdict_no_modification_with_changelog_evidence_is_patched(self):
+        detector = cfc.CopyFailDetector(functional_test=False)
+        host = {"kernel": {"patch_status": "patched"}}
+        checks = {
+            "af_alg_syscall": {"status": "accessible"},
+            "functional_test": {"status": "no_modification", "detail": "primitive ran"},
+            "modules_loaded": [],
+            "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
+            "kernel_patch": {"detected": True,
+                             "evidence": "package changelog references CVE-2026-31431",
+                             "weak_evidence": None},
+        }
+        status, vulnerable, code, _, _ = detector.verdict(host, checks)
+        self.assertEqual(code, cfc.EXIT_SAFE)
+        self.assertEqual(status, "patched")
+        self.assertFalse(vulnerable)
+
+    def test_verdict_setup_failed_is_unverified(self):
+        detector = cfc.CopyFailDetector(functional_test=False)
+        host = {"kernel": {"patch_status": "unverified"}}
+        checks = {
+            "af_alg_syscall": {"status": "accessible"},
+            "functional_test": {"status": "setup_failed", "detail": "ALG_SET_KEY EINVAL"},
+            "modules_loaded": [],
+            "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
+            "kernel_patch": {"detected": False, "evidence": None, "weak_evidence": None},
+        }
+        _, _, code, _, _ = detector.verdict(host, checks)
+        self.assertEqual(code, cfc.EXIT_UNVERIFIED)
+
+    def test_blocked_af_alg_emits_mitigated(self):
+        detector = cfc.CopyFailDetector(functional_test=False)
+        host = {"kernel": {"patch_status": "unverified"}}
+        checks = {
+            "af_alg_syscall": {"status": "blocked"},
             "functional_test": {"status": "not_run"},
             "modules_loaded": [],
             "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
-            "kernel_patch": {"detected": False, "evidence": None},
+            "kernel_patch": {"detected": False, "evidence": None, "weak_evidence": None},
         }
-        self.assertEqual(detector.verdict(host, base_checks)[2], cfc.EXIT_VULNERABLE)
-        patched = dict(base_checks)
-        patched["kernel_patch"] = {"detected": True, "evidence": "commit"}
-        self.assertEqual(detector.verdict(host, patched)[2], cfc.EXIT_SAFE)
-        mitigated = dict(base_checks)
-        mitigated["modprobe_mitigation"] = {"present": True, "files": [], "completeness": "full", "warnings": []}
-        self.assertEqual(detector.verdict(host, mitigated)[2], cfc.EXIT_MITIGATED)
-        confirmed = dict(base_checks)
-        confirmed["functional_test"] = {"status": "modification_detected"}
-        self.assertEqual(detector.verdict(host, confirmed)[2], cfc.EXIT_VULNERABLE)
+        _, _, code, _, _ = detector.verdict(host, checks)
+        self.assertEqual(code, cfc.EXIT_MITIGATED)
+
+    def test_removed_unsafe_heuristic_symbols_are_gone(self):
+        self.assertFalse(hasattr(cfc, "LAST_UNFIXED_MAINLINE"))
+        self.assertFalse(hasattr(cfc, "kernel_tuple"))
+
+    def test_analyze_kernel_patch_never_detects_from_release_string_alone(self):
+        """No matter how high the kernel version, absence of authoritative
+        changelog evidence MUST yield detected=False. Guards against a
+        renamed reimplementation of the LAST_UNFIXED_MAINLINE shortcut."""
+        detector = cfc.CopyFailDetector(functional_test=False)
+        with mock.patch.object(detector, "query_package_changelog", return_value=None):
+            for release in ("7.0.0", "8.0.0", "9.99.99", "6.19.12-200.fc43.x86_64"):
+                with self.subTest(release=release):
+                    result = detector.analyze_kernel_patch(
+                        {"ID": "fedora", "VERSION_ID": "43", "ID_LIKE": "rhel"},
+                        release,
+                        "Linux version {} test\n".format(release),
+                    )
+                    self.assertFalse(result["detected"],
+                                     "release {} alone must not yield detected=True".format(release))
+                    self.assertIsNone(result["evidence"])
+
+    def test_query_package_changelog_uses_kernel_core_on_fedora(self):
+        captured = []
+
+        def fake_run(command, **kwargs):
+            captured.append(command)
+            class R:
+                stdout = ""
+                stderr = ""
+            return R()
+
+        detector = cfc.CopyFailDetector(functional_test=False)
+        with mock.patch.object(cfc.shutil, "which", return_value="/usr/bin/rpm"), \
+                mock.patch.object(cfc.subprocess, "run", side_effect=fake_run):
+            detector.query_package_changelog(
+                {"ID": "fedora", "VERSION_ID": "43", "ID_LIKE": "rhel"},
+                "6.19.12-200.fc43.x86_64",
+            )
+        rpm_targets = [cmd[-1] for cmd in captured]
+        self.assertTrue(any(t.startswith("kernel-core-") for t in rpm_targets),
+                        "expected kernel-core-<release> probe, got {}".format(rpm_targets))
+        self.assertTrue(rpm_targets[0].startswith("kernel-core-"),
+                        "kernel-core probe must come first, got {}".format(rpm_targets))
+        # release must be embedded so we never surface a different package's changelog
+        self.assertIn("6.19.12-200.fc43.x86_64", rpm_targets[0])
 
     def test_json_and_sarif_are_parseable(self):
         result = {
@@ -122,9 +222,9 @@ class DetectorTests(unittest.TestCase):
                 "modprobe_mitigation": {"warnings": []},
             },
             "verdict": {
-                "status": "vulnerable_inferred_kernel",
-                "vulnerable": True,
-                "exit_code": cfc.EXIT_VULNERABLE,
+                "status": "unverified",
+                "vulnerable": False,
+                "exit_code": cfc.EXIT_UNVERIFIED,
                 "summary": "test",
                 "recommendations": [],
             },

