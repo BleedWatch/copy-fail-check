@@ -170,6 +170,23 @@ class DetectorTests(unittest.TestCase):
         self.assertFalse(hasattr(cfc, "LAST_UNFIXED_MAINLINE"))
         self.assertFalse(hasattr(cfc, "kernel_tuple"))
 
+    def test_analyze_kernel_patch_never_detects_from_release_string_alone(self):
+        """No matter how high the kernel version, absence of authoritative
+        changelog evidence MUST yield detected=False. Guards against a
+        renamed reimplementation of the LAST_UNFIXED_MAINLINE shortcut."""
+        detector = cfc.CopyFailDetector(functional_test=False)
+        with mock.patch.object(detector, "query_package_changelog", return_value=None):
+            for release in ("7.0.0", "8.0.0", "9.99.99", "6.19.12-200.fc43.x86_64"):
+                with self.subTest(release=release):
+                    result = detector.analyze_kernel_patch(
+                        {"ID": "fedora", "VERSION_ID": "43", "ID_LIKE": "rhel"},
+                        release,
+                        "Linux version {} test\n".format(release),
+                    )
+                    self.assertFalse(result["detected"],
+                                     "release {} alone must not yield detected=True".format(release))
+                    self.assertIsNone(result["evidence"])
+
     def test_query_package_changelog_uses_kernel_core_on_fedora(self):
         captured = []
 
