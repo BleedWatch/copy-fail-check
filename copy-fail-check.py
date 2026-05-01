@@ -40,7 +40,7 @@ EXIT_VULNERABLE = 2
 EXIT_MITIGATED = 3
 EXIT_DETECTION_ERROR = 10
 EXIT_UNVERIFIED = 11
-EXIT_RUNTIME_ERROR = 11
+EXIT_RUNTIME_ERROR = 11  # intentional alias of EXIT_UNVERIFIED: both mean "non-conclusive, re-investigate"
 EXIT_REMEDIATED = 20
 EXIT_REMEDIATION_CANCELLED = 21
 EXIT_REMEDIATION_FAILED = 22
@@ -104,11 +104,10 @@ def colorize(text, color, enabled):
 
 
 class CopyFailDetector:
-    def __init__(self, root="/", tmp_dir="/tmp", functional_test=True, deep_patch_check=True):
+    def __init__(self, root="/", tmp_dir="/tmp", functional_test=True):
         self.root = root
         self.tmp_dir = tmp_dir
         self.functional_test = functional_test
-        self.deep_patch_check = deep_patch_check
         self.warnings = []
 
     def root_path(self, absolute_path):
@@ -129,7 +128,7 @@ class CopyFailDetector:
             "functional_test": {"status": "not_run", "detail": None},
             "modules_loaded": [],
             "modprobe_mitigation": {"present": False, "files": [], "completeness": "none", "warnings": []},
-            "kernel_patch": {"detected": False, "evidence": None},
+            "kernel_patch": {"detected": False, "evidence": None, "weak_evidence": None},
         }
 
         env_status, env_errors, os_info = self.detect_environment()
@@ -269,15 +268,17 @@ class CopyFailDetector:
         return {"present": bool(blocked), "files": files, "completeness": completeness, "warnings": warnings}
 
     def analyze_kernel_patch(self, os_info, release, proc_version):
-        evidence_tokens = (CVE_ID, PATCH_COMMIT, "authencesn", "copy fail")
-        haystack = "\n".join([proc_version, release]).lower()
-        for token in evidence_tokens:
-            if token.lower() in haystack:
-                return {"detected": True, "evidence": "kernel metadata references {}".format(token)}
         evidence = self.query_package_changelog(os_info, release)
         if evidence:
-            return {"detected": True, "evidence": evidence}
-        return {"detected": False, "evidence": None}
+            return {"detected": True, "evidence": evidence, "weak_evidence": None}
+        weak = None
+        weak_tokens = (CVE_ID, PATCH_COMMIT, "authencesn", "copy fail")
+        haystack = "\n".join([proc_version, release]).lower()
+        for token in weak_tokens:
+            if token.lower() in haystack:
+                weak = "kernel build metadata references {}".format(token)
+                break
+        return {"detected": False, "evidence": None, "weak_evidence": weak}
 
     def query_package_changelog(self, os_info, release):
         family = distro_family(os_info)
@@ -459,7 +460,7 @@ class CopyFailDetector:
                     "Unverified - functional test was not executed and no authoritative patch evidence was found",
                     recommendations)
 
-        recommendations.append("Re-run with --audit on the host, not inside a restricted container")
+        recommendations.append("Re-run on the host (not inside a restricted container) and with root privileges")
         return ("detection_error", True, EXIT_DETECTION_ERROR,
                 "Detection inconclusive - AF_ALG syscall check failed unexpectedly", recommendations)
 
@@ -698,7 +699,8 @@ def make_human(result, use_color=True):
         "",
         "Kernel",
         "  Patch status: {}".format(host["kernel"]["patch_status"]),
-        "  Patch evidence: {}".format(checks["kernel_patch"]["evidence"] or "none"),
+        "  Patch evidence (authoritative): {}".format(checks["kernel_patch"]["evidence"] or "none"),
+        "  Weak signal (informational only): {}".format(checks["kernel_patch"].get("weak_evidence") or "none"),
         "",
         "AF_ALG Status",
         "  Syscall: {}".format(checks["af_alg_syscall"]["status"]),
@@ -738,7 +740,8 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Detect and remediate CVE-2026-31431 Copy Fail exposure")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="run read-only detection (default)")
-    mode.add_argument("--audit", action="store_true", help="run detection plus deeper diagnostic checks")
+    mode.add_argument("--audit", action="store_true",
+                      help="alias of --check; reserved for future detailed diagnostic scoring (changelog probe is now always on)")
     mode.add_argument("--remediate", action="store_true", help="apply AF_ALG modprobe mitigation after confirmation")
     mode.add_argument("--verify", action="store_true", help="verify an earlier remediation")
     parser.add_argument("--json", action="store_true", help="emit structured JSON")
@@ -787,7 +790,7 @@ def main(argv=None):
                 emit_output("\n".join(lines) + "\n", args.output_file)
         return code
 
-    detector = CopyFailDetector(functional_test=not args.verify, deep_patch_check=True)
+    detector = CopyFailDetector(functional_test=not args.verify)
     result = detector.detect()
     if not args.quiet:
         if args.json:
