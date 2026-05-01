@@ -2,14 +2,17 @@
 
 > **⚠️ ADVISORY — v1.0.0 yanked**
 >
-> Version 1.0.0 produces false negatives on systems where the kernel
-> backport status cannot be inferred from the mainline version number
-> (notably Fedora, and any distro running stable branches below 7.0-rc7
-> with potential backports). The functional test in v1.0.0 is also
-> incomplete and does not exercise the full Copy Fail primitive.
+> Version 1.0.0 can incorrectly report "Non vulnerable" by inferring
+> patch status from the kernel mainline version rather than from
+> verified fix evidence. This affects Fedora and any distro running
+> stable kernel branches below 7.0-rc7 unless the vendor fix or
+> backport is explicitly confirmed. Independently of that heuristic,
+> the v1.0.0 functional test is also incomplete and never executes
+> the full Copy Fail primitive (sendmsg + splice + recv), so it
+> returns "no_modification" on every kernel regardless of state.
 >
-> If you ran v1.0.0 and got a "Non vulnerable" verdict, please re-test
-> with v1.1.0+ once released. Do not rely on v1.0.0 verdicts.
+> **Distrust every v1.0.0 "Non vulnerable" verdict** unless it has
+> been independently verified. Re-test with v1.1.0+ once released.
 >
 > Tracking: GitHub issue #1. v1.1.0 in progress.
 
